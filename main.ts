@@ -1877,6 +1877,15 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName("独立涂鸦画板")
+			.setDesc("全屏画板，工具与笔记内涂鸦一致，可导出 PNG 并插入笔记（关闭本设置页即可查看）")
+			.addButton((b) =>
+				b.setButtonText("打开画板").onClick(() => {
+					void this.plugin.activateBoard();
+				})
+			);
+
 		containerEl.createEl("p", {
 			text: "用法：打开任意笔记 → 点击左侧荧光笔图标或 Ctrl+D 进入涂鸦模式，直接在内容上划线标注；点击“完成”或按 Esc 退出。墨迹数据保存在笔记的 free-doodle 属性（frontmatter）中，不影响正文编辑；阅读模式会自动叠加显示。",
 			cls: "free-doodle-setting-hint",
