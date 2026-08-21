@@ -256,8 +256,13 @@ class InkOverlay {
 	private swatchEls: HTMLElement[] = [];
 	private colorInputEl!: HTMLInputElement;
 	private sizeSliderEl!: HTMLInputElement;
+	private sizeLabelEl!: HTMLElement;
 	private opacitySliderEl!: HTMLInputElement;
 	private toolBtnEls: Record<string, HTMLElement> = {};
+
+	private effSize(): number {
+		return this.tool.mode === "hl" ? Math.max(this.tool.size * 4, 12) : this.tool.size;
+	}
 
 	private cw = 0;
 	private ch = 0;
@@ -505,11 +510,16 @@ class InkOverlay {
 		this.sizeSliderEl = tb.createEl("input", {
 			cls: "free-doodle-slider",
 			type: "range",
-			attr: { min: "1", max: "40", step: "1", title: "粗细" },
+			attr: { min: "1", max: "40", step: "1", title: "粗细（像素）" },
 		});
 		this.sizeSliderEl.value = String(this.tool.size);
+		this.sizeLabelEl = tb.createSpan({
+			cls: "free-doodle-size-label",
+			text: `${this.effSize()} px`,
+		});
 		this.sizeSliderEl.addEventListener("input", () => {
 			this.tool.size = Number(this.sizeSliderEl.value);
+			this.sizeLabelEl.setText(`${this.effSize()} px`);
 		});
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -574,6 +584,7 @@ class InkOverlay {
 				this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
 			}
 		}
+		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		this.syncTool();
 	}
 
@@ -595,6 +606,7 @@ class InkOverlay {
 		}
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
+		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		if (this.opacitySliderEl)
 			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
 	}
@@ -626,11 +638,9 @@ class InkOverlay {
 
 		const erase = this.tool.mode === "erasePx";
 		const alpha = erase ? undefined : this.tool.opacity;
-		const size =
-			this.tool.mode === "hl" ? Math.max(this.tool.size * 4, 12) : this.tool.size;
 		this.current = {
 			color: this.tool.color,
-			size,
+			size: this.effSize(),
 			erase,
 			alpha,
 			points: [p],
@@ -1130,6 +1140,10 @@ class DoodleView extends ItemView {
 	private opacityLabelEl!: HTMLElement;
 	private toolBtnEls: Record<string, HTMLElement> = {};
 
+	private effSize(): number {
+		return this.mode === "hl" ? Math.max(this.size * 4, 12) : this.size;
+	}
+
 	constructor(leaf: WorkspaceLeaf, plugin: FreeDoodlePlugin) {
 		super(leaf);
 		this.plugin = plugin;
@@ -1226,9 +1240,10 @@ class DoodleView extends ItemView {
 		});
 		this.sizeSliderEl.value = String(this.size);
 		this.sizeLabelEl = sizeWrap.createSpan({ cls: "free-doodle-size-label" });
+		this.sizeLabelEl.setText(`${this.effSize()} px`);
 		this.sizeSliderEl.addEventListener("input", () => {
 			this.size = Number(this.sizeSliderEl.value);
-			this.sizeLabelEl.setText(String(this.size));
+			this.sizeLabelEl.setText(`${this.effSize()} px`);
 		});
 
 		const opWrap = toolbar.createDiv({ cls: "free-doodle-size-wrap" });
@@ -1300,7 +1315,7 @@ class DoodleView extends ItemView {
 		}
 		if (this.colorInputEl) this.colorInputEl.value = this.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.size);
-		if (this.sizeLabelEl) this.sizeLabelEl.setText(String(this.size));
+		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 	}
 
 	private setBoardMode(mode: BoardTool): void {
@@ -1311,6 +1326,7 @@ class DoodleView extends ItemView {
 				this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
 			if (this.opacityLabelEl) this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
 		}
+		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		this.syncToolbar();
 	}
 
@@ -1365,7 +1381,7 @@ class DoodleView extends ItemView {
 		const erase = this.mode === "erasePx";
 		this.current = {
 			color: this.color,
-			size: this.mode === "hl" ? Math.max(this.size * 4, 12) : this.size,
+			size: this.effSize(),
 			erase,
 			alpha: erase ? undefined : this.opacity,
 			points: [p],
