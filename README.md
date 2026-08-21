@@ -1,4 +1,4 @@
-# Free Doodle
+# Obsidian自由涂鸦 Free Doodle
 
 一个 Obsidian 插件：在笔记上直接涂鸦、划线、圈注，墨迹作为独立图层叠加在文字上方，并随文字位置自动跟随。
 
