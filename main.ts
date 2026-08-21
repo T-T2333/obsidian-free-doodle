@@ -44,6 +44,10 @@ interface Stroke {
 	size: number;
 	erase: boolean;
 	points: Point[];
+	/** 形状：矩形（points 为 [左上, 右下]） */
+	shape?: "rect";
+	/** 不透明度 0.1 - 1，仅非擦除笔生效 */
+	alpha?: number;
 	/** 文字块指纹（所在段落/行的规范化文本前 80 字符） */
 	k?: string;
 	/** 同名文字块的出现序号 */
@@ -58,6 +62,8 @@ interface StoredStroke {
 	size: number;
 	erase: boolean;
 	pts: number[][];
+	shape?: "rect";
+	alpha?: number;
 	k?: string;
 	o?: number;
 	rx?: number;
@@ -127,14 +133,43 @@ class Diag {
 function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): void {
 	ctx.save();
 	if (dx !== 0 || dy !== 0) ctx.translate(dx, dy);
-	ctx.lineCap = "round";
-	ctx.lineJoin = "round";
 	if (s.erase) {
 		ctx.globalCompositeOperation = "destination-out";
+	} else if (s.alpha !== undefined && s.alpha < 1) {
+		ctx.globalAlpha = Math.max(0.05, Math.min(1, s.alpha));
+	}
+	ctx.lineCap = "round";
+	ctx.lineJoin = "round";
+
+	if (s.shape === "rect") {
+		const a = s.points[0];
+		const b = s.points[s.points.length - 1];
+		if (!a || !b) {
+			ctx.restore();
+			return;
+		}
+		const x = Math.min(a.x, b.x);
+		const y = Math.min(a.y, b.y);
+		const w = Math.abs(b.x - a.x);
+		const h = Math.abs(b.y - a.y);
+		ctx.lineWidth = s.size;
+		ctx.beginPath();
+		ctx.rect(x, y, w, h);
+		if (s.erase) {
+			ctx.fillStyle = "#000";
+			ctx.fill();
+		} else {
+			ctx.strokeStyle = s.color;
+			ctx.stroke();
+		}
+		ctx.restore();
+		return;
+	}
+
+	if (s.erase) {
 		ctx.strokeStyle = "#000";
 		ctx.fillStyle = "#000";
 	} else {
-		ctx.globalCompositeOperation = "source-over";
 		ctx.strokeStyle = s.color;
 		ctx.fillStyle = s.color;
 	}
@@ -180,6 +215,8 @@ function parseStrokes(data: DoodleData | null): Stroke[] {
 			o: typeof s.o === "number" ? s.o : undefined,
 			rx: typeof s.rx === "number" ? s.rx : undefined,
 			ry: typeof s.ry === "number" ? s.ry : undefined,
+			shape: s.shape === "rect" ? "rect" : undefined,
+			alpha: typeof s.alpha === "number" ? Math.max(0.05, Math.min(1, s.alpha)) : undefined,
 		}))
 		.filter((s) => s.points.length > 0);
 }
@@ -209,12 +246,18 @@ class InkOverlay {
 	private current: Stroke | null = null;
 	private rect: DOMRect | null = null;
 
-	private tool = { color: "#e03131", size: 4, erase: false };
+	private tool = {
+		color: "#e03131",
+		size: 4,
+		opacity: 1,
+		mode: "pen" as "pen" | "hl" | "rect" | "erasePx" | "eraseStroke",
+	};
 
 	private swatchEls: HTMLElement[] = [];
 	private colorInputEl!: HTMLInputElement;
 	private sizeSliderEl!: HTMLInputElement;
-	private eraserBtnEl!: HTMLElement;
+	private opacitySliderEl!: HTMLInputElement;
+	private toolBtnEls: Record<string, HTMLElement> = {};
 
 	private cw = 0;
 	private ch = 0;
@@ -438,8 +481,8 @@ class InkOverlay {
 			b.style.backgroundColor = c;
 			b.addEventListener("click", () => {
 				this.tool.color = c;
-				this.tool.erase = false;
-				this.syncTool();
+				if (this.isEraseMode()) this.setMode("pen");
+				else this.syncTool();
 			});
 			this.swatchEls.push(b);
 		}
@@ -452,8 +495,8 @@ class InkOverlay {
 		this.colorInputEl.value = this.tool.color;
 		this.colorInputEl.addEventListener("input", () => {
 			this.tool.color = this.colorInputEl.value;
-			this.tool.erase = false;
-			this.syncTool();
+			if (this.isEraseMode()) this.setMode("pen");
+			else this.syncTool();
 		});
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -468,15 +511,41 @@ class InkOverlay {
 			this.tool.size = Number(this.sizeSliderEl.value);
 		});
 
-		this.eraserBtnEl = tb.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "橡皮擦" },
+		tb.createDiv({ cls: "free-doodle-sep" });
+
+		this.opacitySliderEl = tb.createEl("input", {
+			cls: "free-doodle-slider free-doodle-opacity",
+			type: "range",
+			attr: { min: "10", max: "100", step: "5", title: "不透明度" },
 		});
-		setIcon(this.eraserBtnEl, "eraser");
-		this.eraserBtnEl.addEventListener("click", () => {
-			this.tool.erase = !this.tool.erase;
-			this.syncTool();
+		this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
+		const opLabel = tb.createSpan({
+			cls: "free-doodle-size-label",
+			text: `${Math.round(this.tool.opacity * 100)}%`,
 		});
+		this.opacitySliderEl.addEventListener("input", () => {
+			this.tool.opacity = Number(this.opacitySliderEl.value) / 100;
+			opLabel.setText(`${this.opacitySliderEl.value}%`);
+		});
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
+		const tools: Array<{ id: typeof this.tool.mode; icon: string; title: string }> = [
+			{ id: "pen", icon: "pencil", title: "钢笔" },
+			{ id: "hl", icon: "highlighter", title: "荧光笔（半透明）" },
+			{ id: "rect", icon: "square", title: "矩形框选" },
+			{ id: "erasePx", icon: "eraser", title: "橡皮擦（像素擦除）" },
+			{ id: "eraseStroke", icon: "scissors", title: "整笔擦除（点击或划过删除整笔）" },
+		];
+		for (const t of tools) {
+			const b = tb.createEl("button", {
+				cls: "free-doodle-btn clickable-icon",
+				attr: { title: t.title },
+			});
+			setIcon(b, t.icon);
+			b.addEventListener("click", () => this.setMode(t.id));
+			this.toolBtnEls[t.id] = b;
+		}
 
 		const undoBtn = tb.createEl("button", {
 			cls: "free-doodle-btn clickable-icon",
@@ -495,17 +564,38 @@ class InkOverlay {
 		this.syncTool();
 	}
 
+	private setMode(mode: typeof this.tool.mode): void {
+		this.tool.mode = mode;
+		// 切到荧光笔时若不透明度过高，自动降为典型荧光笔透明度
+		if (mode === "hl" && this.tool.opacity > 0.6) {
+			this.tool.opacity = 0.35;
+			if (this.opacitySliderEl) {
+				this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
+			}
+		}
+		this.syncTool();
+	}
+
+	private isEraseMode(): boolean {
+		return this.tool.mode === "erasePx" || this.tool.mode === "eraseStroke";
+	}
+
 	private syncTool(): void {
+		const eraseActive = this.isEraseMode();
 		this.swatchEls.forEach((el) =>
 			el.toggleClass(
 				"is-active",
-				!this.tool.erase &&
+				!eraseActive &&
 					el.style.backgroundColor.toLowerCase() === this.tool.color.toLowerCase()
 			)
 		);
-		this.eraserBtnEl?.toggleClass("is-active", this.tool.erase);
+		for (const [id, el] of Object.entries(this.toolBtnEls)) {
+			el.toggleClass("is-active", id === this.tool.mode);
+		}
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
+		if (this.opacitySliderEl)
+			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
 	}
 
 	/* ---------- 绘制 ---------- */
@@ -521,19 +611,99 @@ class InkOverlay {
 		const canvas = this.canvas;
 		if (!canvas || !evt.isPrimary) return;
 		this.rect = canvas.getBoundingClientRect();
+		this.updateContentOffsetSafe();
 		canvas.setPointerCapture(evt.pointerId);
+		const p = this.toPoint(evt);
+
+		if (this.tool.mode === "eraseStroke") {
+			// 整笔擦除：本次拖动作为一次撤销单元
+			this.undoStack.push(this.strokes.slice());
+			if (this.undoStack.length > 50) this.undoStack.shift();
+			this.removeStrokesNear(p);
+			return;
+		}
+
+		const erase = this.tool.mode === "erasePx";
+		const alpha = erase ? undefined : this.tool.opacity;
+		const size =
+			this.tool.mode === "hl" ? Math.max(this.tool.size * 4, 12) : this.tool.size;
 		this.current = {
 			color: this.tool.color,
-			size: this.tool.size,
-			erase: this.tool.erase,
-			points: [this.toPoint(evt)],
+			size,
+			erase,
+			alpha,
+			points: [p],
+			shape: this.tool.mode === "rect" ? "rect" : undefined,
 		};
 	};
+
+	private updateContentOffsetSafe(): void {
+		/* 预留：锚定偏移在 redraw 时计算 */
+	}
+
+	private removeStrokesNear(p: Point): number {
+		const candidates = this.getCandidateBlocks();
+		let removed = 0;
+		for (let i = this.strokes.length - 1; i >= 0; i--) {
+			const s = this.strokes[i];
+			if (s.erase) continue;
+			const { dx, dy } = this.findBlockDeltaIn(candidates, s);
+			const th = Math.max(10, s.size) + 6;
+			const px = p.x - dx;
+			const py = p.y - dy;
+			let hit = false;
+			if (s.shape === "rect" && s.points.length >= 2) {
+				const a = s.points[0];
+				const b = s.points[s.points.length - 1];
+				const x0 = Math.min(a.x, b.x);
+				const y0 = Math.min(a.y, b.y);
+				const x1 = Math.max(a.x, b.x);
+				const y1 = Math.max(a.y, b.y);
+				const nearEdge =
+					(px >= x0 - th && px <= x1 + th && (Math.abs(py - y0) <= th || Math.abs(py - y1) <= th)) ||
+					(py >= y0 - th && py <= y1 + th && (Math.abs(px - x0) <= th || Math.abs(px - x1) <= th));
+				hit = nearEdge || (px > x0 && px < x1 && py > y0 && py < y1);
+			} else {
+				for (const q of s.points) {
+					const ddx = q.x - px;
+					const ddy = q.y - py;
+					if (ddx * ddx + ddy * ddy <= th * th) {
+						hit = true;
+						break;
+					}
+				}
+			}
+			if (hit) {
+				this.strokes.splice(i, 1);
+				removed++;
+			}
+		}
+		if (removed > 0) {
+			this.redraw();
+			this.scheduleSave();
+		}
+		return removed;
+	}
 
 	private onMove = (evt: PointerEvent): void => {
 		const s = this.current;
 		const ctx = this.ctx;
-		if (!s || !ctx || !evt.isPrimary) return;
+		if (!evt.isPrimary) return;
+
+		if (!s && this.interactive && this.tool.mode === "eraseStroke") {
+			this.removeStrokesNear(this.toPoint(evt));
+			return;
+		}
+		if (!s || !ctx) return;
+
+		// 矩形：拖动预览
+		if (s.shape === "rect") {
+			s.points[1] = this.toPoint(evt);
+			this.redraw();
+			drawStroke(ctx, s);
+			return;
+		}
+
 		s.points.push(this.toPoint(evt));
 		const pts = s.points;
 		const a = pts[pts.length - 2];
@@ -542,11 +712,11 @@ class InkOverlay {
 		ctx.lineCap = "round";
 		ctx.lineJoin = "round";
 		ctx.lineWidth = s.size;
+		if (s.alpha !== undefined && s.alpha < 1) ctx.globalAlpha = s.alpha;
 		if (s.erase) {
 			ctx.globalCompositeOperation = "destination-out";
 			ctx.strokeStyle = "#000";
 		} else {
-			ctx.globalCompositeOperation = "source-over";
 			ctx.strokeStyle = s.color;
 		}
 		ctx.beginPath();
@@ -560,6 +730,14 @@ class InkOverlay {
 		const s = this.current;
 		if (!s) return;
 		this.current = null;
+
+		// 矩形拖动距离过小则丢弃
+		if (s.shape === "rect" && s.points.length >= 2) {
+			const a = s.points[0];
+			const b = s.points[s.points.length - 1];
+			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
+		}
+
 		this.attachAnchor(s);
 		this.undoStack.push(this.strokes.slice());
 		if (this.undoStack.length > 50) this.undoStack.shift();
@@ -848,6 +1026,8 @@ class InkOverlay {
 				o: s.o,
 				rx: s.rx !== undefined ? Math.round(s.rx) : undefined,
 				ry: s.ry !== undefined ? Math.round(s.ry) : undefined,
+				shape: s.shape,
+				alpha: s.alpha,
 			})),
 		};
 	}
@@ -907,6 +1087,8 @@ class InkOverlay {
 /* 独立涂鸦画板视图                                                    */
 /* ------------------------------------------------------------------ */
 
+type BoardTool = "pen" | "hl" | "rect" | "erasePx" | "eraseStroke";
+
 class DoodleView extends ItemView {
 	private plugin: FreeDoodlePlugin;
 	private canvas!: HTMLCanvasElement;
@@ -918,7 +1100,8 @@ class DoodleView extends ItemView {
 
 	private color: string;
 	private size: number;
-	private erasing = false;
+	private opacity = 1;
+	private mode: BoardTool = "pen";
 
 	private rect: DOMRect | null = null;
 	private cw = 0;
@@ -929,7 +1112,9 @@ class DoodleView extends ItemView {
 	private colorInputEl!: HTMLInputElement;
 	private sizeSliderEl!: HTMLInputElement;
 	private sizeLabelEl!: HTMLElement;
-	private eraserBtnEl!: HTMLButtonElement;
+	private opacitySliderEl!: HTMLInputElement;
+	private opacityLabelEl!: HTMLElement;
+	private toolBtnEls: Record<string, HTMLElement> = {};
 
 	constructor(leaf: WorkspaceLeaf, plugin: FreeDoodlePlugin) {
 		super(leaf);
@@ -1002,8 +1187,7 @@ class DoodleView extends ItemView {
 			b.style.backgroundColor = c;
 			b.addEventListener("click", () => {
 				this.color = c;
-				this.erasing = false;
-				this.syncToolbar();
+				this.setBoardMode("pen");
 			});
 			this.swatchEls.push(b);
 		}
@@ -1016,8 +1200,8 @@ class DoodleView extends ItemView {
 		this.colorInputEl.value = this.color;
 		this.colorInputEl.addEventListener("input", () => {
 			this.color = this.colorInputEl.value;
-			this.erasing = false;
-			this.syncToolbar();
+			if (this.mode === "erasePx" || this.mode === "eraseStroke") this.setBoardMode("pen");
+			else this.syncToolbar();
 		});
 
 		const sizeWrap = toolbar.createDiv({ cls: "free-doodle-size-wrap" });
@@ -1033,15 +1217,36 @@ class DoodleView extends ItemView {
 			this.sizeLabelEl.setText(String(this.size));
 		});
 
-		this.eraserBtnEl = toolbar.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "橡皮擦" },
+		const opWrap = toolbar.createDiv({ cls: "free-doodle-size-wrap" });
+		opWrap.createSpan({ text: "不透明" });
+		this.opacitySliderEl = opWrap.createEl("input", {
+			type: "range",
+			attr: { min: "10", max: "100", step: "5" },
 		});
-		setIcon(this.eraserBtnEl, "eraser");
-		this.eraserBtnEl.addEventListener("click", () => {
-			this.erasing = !this.erasing;
-			this.syncToolbar();
+		this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
+		this.opacityLabelEl = opWrap.createSpan({ cls: "free-doodle-size-label" });
+		this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
+		this.opacitySliderEl.addEventListener("input", () => {
+			this.opacity = Number(this.opacitySliderEl.value) / 100;
+			this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
 		});
+
+		const tools: Array<{ id: BoardTool; icon: string; title: string }> = [
+			{ id: "pen", icon: "pencil", title: "钢笔" },
+			{ id: "hl", icon: "highlighter", title: "荧光笔（半透明）" },
+			{ id: "rect", icon: "square", title: "矩形框选" },
+			{ id: "erasePx", icon: "eraser", title: "橡皮擦（像素擦除）" },
+			{ id: "eraseStroke", icon: "scissors", title: "整笔擦除（点击或划过删除整笔）" },
+		];
+		for (const t of tools) {
+			const b = toolbar.createEl("button", {
+				cls: "free-doodle-btn clickable-icon",
+				attr: { title: t.title },
+			});
+			setIcon(b, t.icon);
+			b.addEventListener("click", () => this.setBoardMode(t.id));
+			this.toolBtnEls[t.id] = b;
+		}
 
 		const undoBtn = toolbar.createEl("button", {
 			cls: "free-doodle-btn clickable-icon",
@@ -1069,16 +1274,30 @@ class DoodleView extends ItemView {
 	}
 
 	private syncToolbar(): void {
+		const eraseActive = this.mode === "erasePx" || this.mode === "eraseStroke";
 		this.swatchEls.forEach((el) =>
 			el.toggleClass(
 				"is-active",
-				!this.erasing && el.style.backgroundColor.toLowerCase() === this.color.toLowerCase()
+				!eraseActive && el.style.backgroundColor.toLowerCase() === this.color.toLowerCase()
 			)
 		);
-		this.eraserBtnEl.toggleClass("is-active", this.erasing);
+		for (const [id, el] of Object.entries(this.toolBtnEls)) {
+			el.toggleClass("is-active", id === this.mode);
+		}
 		if (this.colorInputEl) this.colorInputEl.value = this.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(String(this.size));
+	}
+
+	private setBoardMode(mode: BoardTool): void {
+		this.mode = mode;
+		if (mode === "hl" && this.opacity > 0.6) {
+			this.opacity = 0.35;
+			if (this.opacitySliderEl)
+				this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
+			if (this.opacityLabelEl) this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
+		}
+		this.syncToolbar();
 	}
 
 	private resizeCanvas(): void {
@@ -1121,17 +1340,84 @@ class DoodleView extends ItemView {
 		if (!evt.isPrimary) return;
 		this.rect = this.canvas.getBoundingClientRect();
 		this.canvas.setPointerCapture(evt.pointerId);
+		const p = this.toPoint(evt);
+
+		if (this.mode === "eraseStroke") {
+			this.pushUndo();
+			this.removeStrokesNear(p);
+			return;
+		}
+
+		const erase = this.mode === "erasePx";
 		this.current = {
 			color: this.color,
-			size: this.size,
-			erase: this.erasing,
-			points: [this.toPoint(evt)],
+			size: this.mode === "hl" ? Math.max(this.size * 4, 12) : this.size,
+			erase,
+			alpha: erase ? undefined : this.opacity,
+			points: [p],
+			shape: this.mode === "rect" ? "rect" : undefined,
 		};
+	}
+
+	private removeStrokesNear(p: Point): void {
+		let removed = 0;
+		for (let i = this.strokes.length - 1; i >= 0; i--) {
+			const s = this.strokes[i];
+			if (s.erase) continue;
+			const th = Math.max(10, s.size) + 6;
+			let hit = false;
+			if (s.shape === "rect" && s.points.length >= 2) {
+				const a = s.points[0];
+				const b = s.points[s.points.length - 1];
+				const x0 = Math.min(a.x, b.x);
+				const y0 = Math.min(a.y, b.y);
+				const x1 = Math.max(a.x, b.x);
+				const y1 = Math.max(a.y, b.y);
+				const nearEdge =
+					(p.x >= x0 - th &&
+						p.x <= x1 + th &&
+						(Math.abs(p.y - y0) <= th || Math.abs(p.y - y1) <= th)) ||
+					(p.y >= y0 - th &&
+						p.y <= y1 + th &&
+						(Math.abs(p.x - x0) <= th || Math.abs(p.x - x1) <= th));
+				hit = nearEdge || (p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1);
+			} else {
+				for (const q of s.points) {
+					const ddx = q.x - p.x;
+					const ddy = q.y - p.y;
+					if (ddx * ddx + ddy * ddy <= th * th) {
+						hit = true;
+						break;
+					}
+				}
+			}
+			if (hit) {
+				this.strokes.splice(i, 1);
+				removed++;
+			}
+		}
+		if (removed > 0) {
+			this.redraw();
+		}
 	}
 
 	private onMove(evt: PointerEvent): void {
 		const s = this.current;
-		if (!s || !evt.isPrimary) return;
+		if (!evt.isPrimary) return;
+
+		if (!s && this.mode === "eraseStroke") {
+			this.removeStrokesNear(this.toPoint(evt));
+			return;
+		}
+		if (!s) return;
+
+		if (s.shape === "rect") {
+			s.points[1] = this.toPoint(evt);
+			this.redraw();
+			drawStroke(this.ctx, s);
+			return;
+		}
+
 		s.points.push(this.toPoint(evt));
 		const pts = s.points;
 		const a = pts[pts.length - 2];
@@ -1140,11 +1426,11 @@ class DoodleView extends ItemView {
 		this.ctx.lineCap = "round";
 		this.ctx.lineJoin = "round";
 		this.ctx.lineWidth = s.size;
+		if (s.alpha !== undefined && s.alpha < 1) this.ctx.globalAlpha = s.alpha;
 		if (s.erase) {
 			this.ctx.globalCompositeOperation = "destination-out";
 			this.ctx.strokeStyle = "#000";
 		} else {
-			this.ctx.globalCompositeOperation = "source-over";
 			this.ctx.strokeStyle = s.color;
 		}
 		this.ctx.beginPath();
@@ -1158,6 +1444,13 @@ class DoodleView extends ItemView {
 		const s = this.current;
 		if (!s) return;
 		this.current = null;
+
+		if (s.shape === "rect" && s.points.length >= 2) {
+			const a = s.points[0];
+			const b = s.points[s.points.length - 1];
+			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
+		}
+
 		this.pushUndo();
 		this.strokes.push(s);
 		this.redraw();
