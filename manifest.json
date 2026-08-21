@@ -1,7 +1,7 @@
 {
 	"id": "free-doodle",
 	"name": "Free Doodle",
-	"version": "1.5.1",
+	"version": "1.5.2",
 	"minAppVersion": "1.5.0",
 	"description": "在笔记上直接涂鸦划线标注，墨迹保存在 md 文件中；另附独立画板可导出 PNG。",
 	"author": "96117",

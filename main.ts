@@ -258,6 +258,7 @@ class InkOverlay {
 	private sizeSliderEl!: HTMLInputElement;
 	private sizeLabelEl!: HTMLElement;
 	private opacitySliderEl!: HTMLInputElement;
+	private opacityLabelEl!: HTMLElement;
 	private toolBtnEls: Record<string, HTMLElement> = {};
 
 	private effSize(): number {
@@ -530,13 +531,13 @@ class InkOverlay {
 			attr: { min: "10", max: "100", step: "5", title: "不透明度" },
 		});
 		this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
-		const opLabel = tb.createSpan({
+		this.opacityLabelEl = tb.createSpan({
 			cls: "free-doodle-size-label",
 			text: `${Math.round(this.tool.opacity * 100)}%`,
 		});
 		this.opacitySliderEl.addEventListener("input", () => {
 			this.tool.opacity = Number(this.opacitySliderEl.value) / 100;
-			opLabel.setText(`${this.opacitySliderEl.value}%`);
+			this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
 		});
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -609,6 +610,8 @@ class InkOverlay {
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		if (this.opacitySliderEl)
 			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
+		if (this.opacityLabelEl)
+			this.opacityLabelEl.setText(`${Math.round(this.tool.opacity * 100)}%`);
 	}
 
 	/* ---------- 绘制 ---------- */
@@ -653,7 +656,7 @@ class InkOverlay {
 	}
 
 	private removeStrokesNear(p: Point): number {
-		const candidates = this.getCandidateBlocks();
+		const candidates = this.getCandidateEntries();
 		let removed = 0;
 		for (let i = this.strokes.length - 1; i >= 0; i--) {
 			const s = this.strokes[i];
@@ -800,9 +803,9 @@ class InkOverlay {
 		if (!ctx) return;
 		ctx.clearRect(0, 0, this.cw, this.ch);
 		if (!this.strokes.length) return;
-		const candidates = this.getCandidateBlocks();
+		const entries = this.getCandidateEntries();
 		for (const s of this.strokes) {
-			const { dx, dy } = this.findBlockDeltaIn(candidates, s);
+			const { dx, dy } = this.findBlockDeltaIn(entries, s);
 			drawStroke(ctx, s, dx, dy);
 		}
 	}
@@ -813,32 +816,33 @@ class InkOverlay {
 		return normText(el.textContent ?? "").slice(0, 80);
 	}
 
-	private candCache: HTMLElement[] | null = null;
+	private candCache: { el: HTMLElement; key: string }[] | null = null;
 
-	private getCandidateBlocks(): HTMLElement[] {
+	/** 候选文字块及其 key 缓存：key 只计算一次，重绘/命中测试复用，避免频繁读取 textContent 造成卡顿 */
+	private getCandidateEntries(): { el: HTMLElement; key: string }[] {
 		if (this.candCache) return this.candCache;
 		if (!this.scroller) return [];
 		this.candCache = Array.from(
 			this.scroller.querySelectorAll<HTMLElement>(InkOverlay.BLOCK_SEL)
-		);
+		).map((el) => ({ el, key: InkOverlay.blockKey(el) }));
 		return this.candCache;
 	}
 
 	private findBlockDeltaIn(
-		candidates: HTMLElement[],
+		candidates: { el: HTMLElement; key: string }[],
 		s: Stroke
 	): { dx: number; dy: number } {
 		if (!s.k || !this.canvas) return { dx: 0, dy: 0 };
 		const cRect = this.canvas.getBoundingClientRect();
 		let occ = 0;
-		for (const el of candidates) {
-			const t = InkOverlay.blockKey(el);
+		for (const c of candidates) {
+			const t = c.key;
 			if (!t) continue;
 			const matched =
 				t === s.k || (t.length > 10 && (t.includes(s.k) || s.k.includes(t)));
 			if (!matched) continue;
 			if (occ === (s.o ?? 0)) {
-				const r = el.getBoundingClientRect();
+				const r = c.el.getBoundingClientRect();
 				return {
 					dx: r.left - cRect.left - (s.rx ?? 0),
 					dy: r.top - cRect.top - (s.ry ?? 0),
