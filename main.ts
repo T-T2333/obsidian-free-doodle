@@ -1242,7 +1242,6 @@ export default class FreeDoodlePlugin extends Plugin {
 		this.addCommand({
 			id: "toggle-annotate",
 			name: "开始 / 结束当前笔记涂鸦",
-			hotkeys: [{ modifiers: ["Ctrl"], key: "d" }],
 			callback: () => {
 				void this.toggleAnnotate();
 			},
