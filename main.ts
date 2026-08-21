@@ -367,6 +367,7 @@ class InkOverlay {
 			return;
 		}
 		this.scroller = scroller;
+		this.candCache = null;
 		Diag.log(
 			`mount 容器=${scroller.className.slice(0, 50)} w=${scroller.clientWidth} h=${scroller.scrollHeight} strokes=${this.strokes.length}`
 		);
@@ -705,6 +706,15 @@ class InkOverlay {
 		}
 
 		s.points.push(this.toPoint(evt));
+
+		// 半透明笔迹（荧光笔等）：逐段绘制会在端点重叠处产生圆点残影，
+		// 改为整幅重绘 + 整条描边，保证透明度均匀
+		if (!s.erase && s.alpha !== undefined && s.alpha < 1) {
+			this.redraw();
+			drawStroke(ctx, s);
+			return;
+		}
+
 		const pts = s.points;
 		const a = pts[pts.length - 2];
 		const b = pts[pts.length - 1];
@@ -793,11 +803,15 @@ class InkOverlay {
 		return normText(el.textContent ?? "").slice(0, 80);
 	}
 
+	private candCache: HTMLElement[] | null = null;
+
 	private getCandidateBlocks(): HTMLElement[] {
+		if (this.candCache) return this.candCache;
 		if (!this.scroller) return [];
-		return Array.from(
+		this.candCache = Array.from(
 			this.scroller.querySelectorAll<HTMLElement>(InkOverlay.BLOCK_SEL)
 		);
+		return this.candCache;
 	}
 
 	private findBlockDeltaIn(
@@ -1419,6 +1433,14 @@ class DoodleView extends ItemView {
 		}
 
 		s.points.push(this.toPoint(evt));
+
+		// 半透明笔迹：整幅重绘避免端点残影
+		if (!s.erase && s.alpha !== undefined && s.alpha < 1) {
+			this.redraw();
+			drawStroke(this.ctx, s);
+			return;
+		}
+
 		const pts = s.points;
 		const a = pts[pts.length - 2];
 		const b = pts[pts.length - 1];
