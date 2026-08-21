@@ -1,0 +1,175 @@
+/* ============ 笔记内涂鸦 ============ */
+
+.free-doodle-overlay {
+	position: absolute;
+	top: 0;
+	left: 0;
+	z-index: 30;
+	pointer-events: none;
+}
+
+.free-doodle-canvas {
+	display: block;
+	pointer-events: none;
+}
+
+.free-doodle-overlay.is-interactive .free-doodle-canvas {
+	pointer-events: auto;
+	touch-action: none;
+	cursor: crosshair;
+}
+
+.free-doodle-board {
+	width: 100%;
+	height: 100%;
+	background: #fff;
+	pointer-events: auto;
+	touch-action: none;
+	cursor: crosshair;
+}
+
+.free-doodle-floatbar {
+	position: absolute;
+	top: 10px;
+	right: 18px;
+	z-index: 1000;
+	display: flex;
+	align-items: center;
+	gap: 4px;
+	padding: 4px 8px;
+	border-radius: 10px;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+	box-shadow: var(--shadow-s);
+}
+
+.free-doodle-floatbar .free-doodle-swatch {
+	width: 18px;
+	height: 18px;
+}
+
+.free-doodle-slider {
+	width: 80px;
+	accent-color: var(--interactive-accent);
+}
+
+.free-doodle-sep {
+	width: 1px;
+	height: 18px;
+	background: var(--background-modifier-border);
+	margin: 0 3px;
+	flex-shrink: 0;
+}
+
+.free-doodle-inline {
+	margin: 8px 0;
+	line-height: 0;
+}
+
+.free-doodle-placeholder {
+	color: var(--text-faded);
+	font-size: var(--font-ui-smaller);
+	padding: 2px 0;
+	user-select: none;
+}
+
+.free-doodle-broken {
+	color: var(--text-faded);
+	font-size: var(--font-ui-smaller);
+}
+
+.free-doodle-setting-hint {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.free-doodle-diag {
+	width: 100%;
+	font-family: var(--font-monospace);
+	font-size: var(--font-ui-smaller);
+	line-height: 1.4;
+	resize: vertical;
+	white-space: pre;
+}
+
+/* ============ 独立画板 ============ */
+
+.free-doodle-root {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+	padding: 0;
+}
+
+.free-doodle-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+	padding: 8px 10px;
+	border-bottom: 1px solid var(--background-modifier-border);
+	background: var(--background-secondary);
+}
+
+.free-doodle-swatch {
+	width: 24px;
+	height: 24px;
+	border-radius: 50%;
+	border: 2px solid var(--background-modifier-border);
+	padding: 0;
+	cursor: pointer;
+	flex-shrink: 0;
+}
+
+.free-doodle-swatch.is-active,
+.free-doodle-btn.is-active {
+	border-color: var(--interactive-accent);
+	box-shadow: 0 0 0 2px var(--background-primary);
+}
+
+.free-doodle-color-input {
+	width: 32px;
+	height: 24px;
+	padding: 0;
+	border: none;
+	background: none;
+	cursor: pointer;
+}
+
+.free-doodle-size-wrap {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	margin-left: 4px;
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
+.free-doodle-size-label {
+	min-width: 2ch;
+	text-align: center;
+}
+
+.free-doodle-btn {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	height: 28px;
+	padding: 0 6px;
+	cursor: pointer;
+	border-radius: var(--radius-s);
+	background: transparent;
+	border: 2px solid transparent;
+	color: var(--text-normal);
+}
+
+.free-doodle-save {
+	margin-left: auto;
+	padding: 0 10px;
+}
+
+.free-doodle-canvas-wrap {
+	position: relative;
+	flex: 1;
+	overflow: hidden;
+}
