@@ -1,9 +1,9 @@
 {
 	"id": "free-doodle",
 	"name": "Free Doodle",
-	"version": "1.5.3",
-	"minAppVersion": "1.5.0",
-	"description": "在笔记上直接涂鸦划线标注，墨迹保存在 md 文件中；另附独立画板可导出 PNG。",
-	"author": "96117",
+	"version": "1.6.0",
+	"minAppVersion": "1.7.2",
+	"description": "Draw and annotate directly on notes. Ink follows text as you edit, with highlighter, shapes and erasers.",
+	"author": "T-T2333",
 	"isDesktopOnly": false
 }

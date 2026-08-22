@@ -250,7 +250,7 @@ class InkOverlay {
 		color: "#e03131",
 		size: 4,
 		opacity: 1,
-		mode: "pen" as "pen" | "hl" | "rect" | "erasePx" | "eraseStroke",
+		mode: "pen" as ToolMode,
 	};
 
 	private swatchEls: HTMLElement[] = [];
@@ -289,7 +289,7 @@ class InkOverlay {
 		if (this.interactive && !this.hadStoredData) {
 			await this.ensurePlaceholder();
 			// 等待编辑器渲染属性面板、布局稳定后再挂载画布
-			await new Promise((resolve) => setTimeout(resolve, 300));
+			await new Promise((resolve) => window.setTimeout(resolve, 300));
 		}
 		this.mount();
 		this.timer = window.setInterval(this.tick, 400);
@@ -351,7 +351,7 @@ class InkOverlay {
 		this.mo = new MutationObserver(() => {
 			if (this.destroyed) return;
 			if (!this.canvas || !this.canvas.isConnected) {
-				requestAnimationFrame(() => {
+				window.requestAnimationFrame(() => {
 					if (!this.destroyed && (!this.canvas || !this.canvas.isConnected)) {
 						this.mount();
 					}
@@ -379,12 +379,8 @@ class InkOverlay {
 		);
 
 		const content = this.view.contentEl;
-		if (getComputedStyle(content).position === "static") {
-			content.style.position = "relative";
-		}
-		if (getComputedStyle(scroller).position === "static") {
-			scroller.style.position = "relative";
-		}
+		content.addClass("free-doodle-positioned");
+		scroller.addClass("free-doodle-positioned");
 
 		const wrap = scroller.createDiv({ cls: "free-doodle-overlay" });
 		wrap.toggleClass("is-interactive", this.interactive);
@@ -472,7 +468,7 @@ class InkOverlay {
 
 		const doneBtn = tb.createEl("button", {
 			cls: "free-doodle-btn mod-cta",
-			attr: { title: "完成并保存 (Esc)" },
+			attr: { title: "完成并保存" },
 		});
 		setIcon(doneBtn, "check");
 		doneBtn.createSpan({ text: "完成" });
@@ -542,7 +538,7 @@ class InkOverlay {
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
-		const tools: Array<{ id: typeof this.tool.mode; icon: string; title: string }> = [
+		const tools: Array<{ id: ToolMode; icon: string; title: string }> = [
 			{ id: "pen", icon: "pencil", title: "钢笔" },
 			{ id: "hl", icon: "highlighter", title: "荧光笔（半透明）" },
 			{ id: "rect", icon: "square", title: "矩形框选" },
@@ -576,7 +572,7 @@ class InkOverlay {
 		this.syncTool();
 	}
 
-	private setMode(mode: typeof this.tool.mode): void {
+	private setMode(mode: ToolMode): void {
 		this.tool.mode = mode;
 		// 切到荧光笔时若不透明度过高，自动降为典型荧光笔透明度
 		if (mode === "hl" && this.tool.opacity > 0.6) {
@@ -878,26 +874,44 @@ class InkOverlay {
 			if (!canvas || !scroller || !this.rect) return;
 			const cRect = canvas.getBoundingClientRect();
 			const p = s.points[0];
-		 const doc = document as Document & {
+			const doc = document as Document & {
 				caretRangeFromPoint?: (x: number, y: number) => Range | null;
+				caretPositionFromPoint?: (
+					x: number,
+					y: number
+				) => { offsetNode: Node; offset: number } | null;
 			};
-			if (!doc.caretRangeFromPoint) return;
+			if (!doc.caretRangeFromPoint && !doc.caretPositionFromPoint) return;
 			// 关键：临时让画布对命中测试透明，否则只会命中画布自身而非下方文字
-			const prevPE = canvas.style.pointerEvents;
-			canvas.style.pointerEvents = "none";
-			let range: Range | null = null;
+			canvas.addClass("hit-test-off");
+			let hitNode: Node | null = null;
+			let hitOffset = 0;
 			try {
-				range = doc.caretRangeFromPoint(cRect.left + p.x, cRect.top + p.y);
+				if (doc.caretPositionFromPoint) {
+					const pos = doc.caretPositionFromPoint(cRect.left + p.x, cRect.top + p.y);
+					if (pos) {
+						hitNode = pos.offsetNode;
+						hitOffset = pos.offset;
+					}
+				} else if (doc.caretRangeFromPoint) {
+					const range = doc.caretRangeFromPoint(cRect.left + p.x, cRect.top + p.y);
+					if (range) {
+						hitNode = range.startContainer;
+						hitOffset = range.startOffset;
+					}
+				}
 			} finally {
-				canvas.style.pointerEvents = prevPE;
+				canvas.removeClass("hit-test-off");
 			}
-			if (!range || !range.startContainer) return;
-			let node: Node = range.startContainer;
+			if (!hitNode) return;
+			let node: Node = hitNode;
+			let offset = hitOffset;
 			if (node.nodeType !== Node.TEXT_NODE) {
-				node = node.childNodes[range.startOffset] ?? node;
+				node = node.childNodes[offset] ?? node;
 			}
-			if (!(node instanceof Text)) return;
-			const parentEl = node.parentElement;
+			// 跨窗口安全判断：用 nodeType 而不是 instanceof
+			if (node.nodeType !== Node.TEXT_NODE) return;
+			const parentEl = (node as Text).parentElement;
 			if (!parentEl) return;
 			const blockEl = parentEl.closest<HTMLElement>(InkOverlay.BLOCK_SEL) ?? parentEl;
 			const key = InkOverlay.blockKey(blockEl);
@@ -1116,6 +1130,8 @@ class InkOverlay {
 /* ------------------------------------------------------------------ */
 
 type BoardTool = "pen" | "hl" | "rect" | "erasePx" | "eraseStroke";
+
+type ToolMode = "pen" | "hl" | "rect" | "erasePx" | "eraseStroke";
 
 class DoodleView extends ItemView {
 	private plugin: FreeDoodlePlugin;
@@ -1630,7 +1646,6 @@ export default class FreeDoodlePlugin extends Plugin {
 					const dpr = Math.min(window.devicePixelRatio || 1, 2);
 					canvas.width = Math.floor(w * dpr);
 					canvas.height = Math.floor(h * dpr);
-					canvas.style.maxWidth = "100%";
 					const c2d = canvas.getContext("2d");
 					if (!c2d) return;
 					c2d.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -1664,7 +1679,8 @@ export default class FreeDoodlePlugin extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const stored = (await this.loadData()) as Partial<FreeDoodleSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? {});
 	}
 
 	async saveSettings(): Promise<void> {
@@ -1788,12 +1804,10 @@ export default class FreeDoodlePlugin extends Plugin {
 		let cleaned = 0;
 		for (const f of files) {
 			if (activeFiles.has(f.path)) continue;
-			const fm = this.app.metadataCache.getFileCache(f)?.frontmatter as
-				| Record<string, unknown>
-				| undefined;
-			const b64 = fm ? fm[FRONT_KEY] : undefined;
+			const fm = this.app.metadataCache.getFileCache(f)?.frontmatter;
+			const b64 = fm ? (fm as Record<string, unknown>)[FRONT_KEY] : undefined;
 			if (typeof b64 !== "string" || b64.length === 0) continue;
-			let isEmpty = true;
+			let isEmpty: boolean;
 			try {
 				isEmpty = parseStrokes(JSON.parse(fromBase64(b64)) as DoodleData).length === 0;
 			} catch {
@@ -1838,7 +1852,7 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl("h3", { text: "Free Doodle 设置" });
+		new Setting(containerEl).setName("常规").setHeading();
 
 		new Setting(containerEl)
 			.setName("默认画笔颜色")
@@ -1857,7 +1871,6 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 				sb
 					.setLimits(1, 40, 1)
 					.setValue(this.plugin.settings.penSize)
-					.setDynamicTooltip()
 					.onChange(async (v) => {
 						this.plugin.settings.penSize = v;
 						await this.plugin.saveSettings();
@@ -1895,7 +1908,7 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 	}
 
 	private buildDiagnostics(containerEl: HTMLElement): void {
-		containerEl.createEl("h3", { text: "诊断" });
+		new Setting(containerEl).setName("诊断日志").setHeading();
 
 		const textarea = containerEl.createEl("textarea", {
 			cls: "free-doodle-diag",

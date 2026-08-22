@@ -1,11 +1,24 @@
 /* ============ 笔记内涂鸦 ============ */
 
+.free-doodle-positioned {
+	position: relative;
+}
+
 .free-doodle-overlay {
 	position: absolute;
 	top: 0;
 	left: 0;
 	z-index: 30;
 	pointer-events: none;
+}
+
+/* 命中测试时临时让画布对指针透明 */
+.free-doodle-canvas.hit-test-off {
+	pointer-events: none !important;
+}
+
+.free-doodle-inline canvas {
+	max-width: 100%;
 }
 
 .free-doodle-canvas {
