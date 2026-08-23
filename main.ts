@@ -1110,34 +1110,26 @@ class InkOverlay {
 		const fade = 900;
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
-		const cfg = this.plugin.settings.brushes.laser;
-		const ctx = this.ctx;
-		ctx.save();
-		ctx.globalCompositeOperation = "lighter";
-		ctx.lineCap = "round";
-		for (let i = 1; i < this.laserPts.length; i++) {
-			const p0 = this.laserPts[i - 1];
-			const p1 = this.laserPts[i];
-			const a = Math.max(0, 1 - (now - p1.t) / fade);
-			ctx.globalAlpha = a * cfg.opacity;
-			ctx.lineWidth = cfg.size * (0.4 + 0.6 * a);
+		if (this.laserPts.length > 1) {
+			// 单路径渲染：整条轨迹统一透明度，随最新点年龄整体淡出（无逐段叠加圆点）
+			const cfg = this.plugin.settings.brushes.laser;
+			const ctx = this.ctx;
+			const newest = this.laserPts[this.laserPts.length - 1].t;
+			const life = Math.max(0, 1 - (now - newest) / fade);
+			ctx.save();
+			ctx.globalCompositeOperation = "lighter";
+			ctx.globalAlpha = life * cfg.opacity;
 			ctx.strokeStyle = this.tool.color;
+			ctx.lineWidth = cfg.size;
+			ctx.lineCap = "round";
+			ctx.lineJoin = "round";
 			ctx.beginPath();
-			ctx.moveTo(p0.x, p0.y);
-			ctx.lineTo(p1.x, p1.y);
+			ctx.moveTo(this.laserPts[0].x, this.laserPts[0].y);
+			for (let i = 1; i < this.laserPts.length; i++)
+				ctx.lineTo(this.laserPts[i].x, this.laserPts[i].y);
 			ctx.stroke();
+			ctx.restore();
 		}
-		const tip = this.laserPts[this.laserPts.length - 1];
-		if (tip && now - tip.t < fade * 0.6) {
-			ctx.globalAlpha = 1;
-			ctx.fillStyle = "#ffffff";
-			ctx.shadowColor = this.tool.color;
-			ctx.shadowBlur = cfg.size * 2;
-			ctx.beginPath();
-			ctx.arc(tip.x, tip.y, Math.max(2, cfg.size * 0.5), 0, Math.PI * 2);
-			ctx.fill();
-		}
-		ctx.restore();
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
 		if (this.laserPts.length > 0 || this.tool.mode === "laser") {
 			window.requestAnimationFrame(() => this.laserLoop());
@@ -2353,34 +2345,26 @@ class DoodleView extends ItemView {
 		const fade = 900;
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
-		const cfg = this.plugin.settings.brushes.laser;
-		const ctx = this.ctx;
-		ctx.save();
-		ctx.globalCompositeOperation = "lighter";
-		ctx.lineCap = "round";
-		for (let i = 1; i < this.laserPts.length; i++) {
-			const p0 = this.laserPts[i - 1];
-			const p1 = this.laserPts[i];
-			const a = Math.max(0, 1 - (now - p1.t) / fade);
-			ctx.globalAlpha = a * cfg.opacity;
-			ctx.lineWidth = cfg.size * (0.4 + 0.6 * a);
+		if (this.laserPts.length > 1) {
+			// 单路径渲染：整条轨迹统一透明度，随最新点年龄整体淡出（无逐段叠加圆点）
+			const cfg = this.plugin.settings.brushes.laser;
+			const ctx = this.ctx;
+			const newest = this.laserPts[this.laserPts.length - 1].t;
+			const life = Math.max(0, 1 - (now - newest) / fade);
+			ctx.save();
+			ctx.globalCompositeOperation = "lighter";
+			ctx.globalAlpha = life * cfg.opacity;
 			ctx.strokeStyle = this.color;
+			ctx.lineWidth = cfg.size;
+			ctx.lineCap = "round";
+			ctx.lineJoin = "round";
 			ctx.beginPath();
-			ctx.moveTo(p0.x, p0.y);
-			ctx.lineTo(p1.x, p1.y);
+			ctx.moveTo(this.laserPts[0].x, this.laserPts[0].y);
+			for (let i = 1; i < this.laserPts.length; i++)
+				ctx.lineTo(this.laserPts[i].x, this.laserPts[i].y);
 			ctx.stroke();
+			ctx.restore();
 		}
-		const tip = this.laserPts[this.laserPts.length - 1];
-		if (tip && now - tip.t < fade * 0.6) {
-			ctx.globalAlpha = 1;
-			ctx.fillStyle = "#ffffff";
-			ctx.shadowColor = this.color;
-			ctx.shadowBlur = cfg.size * 2;
-			ctx.beginPath();
-			ctx.arc(tip.x, tip.y, Math.max(2, cfg.size * 0.5), 0, Math.PI * 2);
-			ctx.fill();
-		}
-		ctx.restore();
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
 		if (this.laserPts.length > 0 || this.mode === "laser") {
 			window.requestAnimationFrame(() => this.laserLoop());
