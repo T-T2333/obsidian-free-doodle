@@ -350,6 +350,8 @@ class InkOverlay {
 		this.mo?.disconnect();
 		this.mo = new MutationObserver(() => {
 			if (this.destroyed) return;
+			// 笔记内容变化后文字块缓存即失效，避免锚定到已分离的旧元素
+			this.candCache = null;
 			if (!this.canvas || !this.canvas.isConnected) {
 				window.requestAnimationFrame(() => {
 					if (!this.destroyed && (!this.canvas || !this.canvas.isConnected)) {
@@ -623,14 +625,12 @@ class InkOverlay {
 		const canvas = this.canvas;
 		if (!canvas || !evt.isPrimary) return;
 		this.rect = canvas.getBoundingClientRect();
-		this.updateContentOffsetSafe();
 		canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
 
 		if (this.tool.mode === "eraseStroke") {
-			// 整笔擦除：本次拖动作为一次撤销单元
-			this.undoStack.push(this.strokes.slice());
-			if (this.undoStack.length > 50) this.undoStack.shift();
+			// 首次真正删除笔画时才记录撤销快照，避免空点浪费撤销次数
+			this.strokeEraseUndoArmed = true;
 			this.removeStrokesNear(p);
 			return;
 		}
@@ -647,17 +647,15 @@ class InkOverlay {
 		};
 	};
 
-	private updateContentOffsetSafe(): void {
-		/* 预留：锚定偏移在 redraw 时计算 */
-	}
+	private strokeEraseUndoArmed = false;
 
 	private removeStrokesNear(p: Point): number {
-		const candidates = this.getCandidateEntries();
+		const entries = this.getCandidateEntries();
 		let removed = 0;
 		for (let i = this.strokes.length - 1; i >= 0; i--) {
 			const s = this.strokes[i];
 			if (s.erase) continue;
-			const { dx, dy } = this.findBlockDeltaIn(candidates, s);
+			const { dx, dy } = this.findBlockDeltaIn(entries, s);
 			const th = Math.max(10, s.size) + 6;
 			const px = p.x - dx;
 			const py = p.y - dy;
@@ -684,6 +682,11 @@ class InkOverlay {
 				}
 			}
 			if (hit) {
+				if (this.strokeEraseUndoArmed) {
+					this.undoStack.push(this.strokes.slice());
+					if (this.undoStack.length > 50) this.undoStack.shift();
+					this.strokeEraseUndoArmed = false;
+				}
 				this.strokes.splice(i, 1);
 				removed++;
 			}
@@ -832,6 +835,7 @@ class InkOverlay {
 		const cRect = this.canvas.getBoundingClientRect();
 		let occ = 0;
 		for (const c of candidates) {
+			if (!c.el.isConnected) continue;
 			const t = c.key;
 			if (!t) continue;
 			const matched =
@@ -874,7 +878,8 @@ class InkOverlay {
 			if (!canvas || !scroller || !this.rect) return;
 			const cRect = canvas.getBoundingClientRect();
 			const p = s.points[0];
-			const doc = document as Document & {
+			// 使用画布所在文档：兼容笔记弹出到独立窗口的场景
+			const doc = canvas.ownerDocument as Document & {
 				caretRangeFromPoint?: (x: number, y: number) => Range | null;
 				caretPositionFromPoint?: (
 					x: number,
@@ -1393,7 +1398,7 @@ class DoodleView extends ItemView {
 		const p = this.toPoint(evt);
 
 		if (this.mode === "eraseStroke") {
-			this.pushUndo();
+			this.strokeEraseUndoArmed = true;
 			this.removeStrokesNear(p);
 			return;
 		}
@@ -1408,6 +1413,8 @@ class DoodleView extends ItemView {
 			shape: this.mode === "rect" ? "rect" : undefined,
 		};
 	}
+
+	private strokeEraseUndoArmed = false;
 
 	private removeStrokesNear(p: Point): void {
 		let removed = 0;
@@ -1442,6 +1449,10 @@ class DoodleView extends ItemView {
 				}
 			}
 			if (hit) {
+				if (this.strokeEraseUndoArmed) {
+					this.pushUndo();
+					this.strokeEraseUndoArmed = false;
+				}
 				this.strokes.splice(i, 1);
 				removed++;
 			}
