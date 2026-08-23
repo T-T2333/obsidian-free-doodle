@@ -8,6 +8,7 @@ import {
 	PluginSettingTab,
 	Setting,
 	SettingDefinition,
+	SettingDefinitionGroup,
 	SettingDefinitionItem,
 	TFile,
 	WorkspaceLeaf,
@@ -50,6 +51,14 @@ interface Stroke {
 	shape?: DrawShape;
 	/** 不透明度 0.1 - 1，仅非擦除笔生效 */
 	alpha?: number;
+	/** 笔刷类型（自由笔迹） */
+	brush?: BrushId;
+	/** 钢笔逐点宽度（速度感应） */
+	w?: number[];
+	/** 文本标注内容 */
+	text?: string;
+	/** 浓度 0-100（铅笔颗粒/马克笔叠层） */
+	density?: number;
 	/** 文字块指纹（所在段落/行的规范化文本前 80 字符） */
 	k?: string;
 	/** 同名文字块的出现序号 */
@@ -66,6 +75,10 @@ interface StoredStroke {
 	pts: number[][];
 	shape?: DrawShape;
 	alpha?: number;
+	brush?: BrushId;
+	w?: number[];
+	text?: string;
+	density?: number;
 	k?: string;
 	o?: number;
 	rx?: number;
@@ -83,12 +96,40 @@ interface FreeDoodleSettings {
 	penColor: string;
 	penSize: number;
 	saveFolder: string;
+	autoFit: boolean;
+	brushes: Record<BrushId, BrushCfg>;
+}
+
+interface BrushCfg {
+	size: number;
+	opacity: number;
+	density: number;
+	stability: number;
+}
+
+const BRUSH_IDS: BrushId[] = ["pen", "pencil", "ball", "marker", "hl", "laser"];
+
+const BRUSH_DEFAULTS: Record<BrushId, BrushCfg> = {
+	pen: { size: 4, opacity: 1, density: 70, stability: 55 },
+	pencil: { size: 3, opacity: 0.8, density: 45, stability: 35 },
+	ball: { size: 3, opacity: 0.92, density: 85, stability: 65 },
+	marker: { size: 10, opacity: 0.6, density: 60, stability: 70 },
+	hl: { size: 10, opacity: 0.35, density: 50, stability: 60 },
+	laser: { size: 6, opacity: 0.9, density: 90, stability: 85 },
+};
+
+function defaultBrushes(): Record<BrushId, BrushCfg> {
+	const out = {} as Record<BrushId, BrushCfg>;
+	for (const id of BRUSH_IDS) out[id] = { ...BRUSH_DEFAULTS[id] };
+	return out;
 }
 
 const DEFAULT_SETTINGS: FreeDoodleSettings = {
 	penColor: "#e03131",
 	penSize: 4,
 	saveFolder: "涂鸦",
+	autoFit: true,
+	brushes: defaultBrushes(),
 };
 
 const PALETTE = [
@@ -99,6 +140,18 @@ const PALETTE = [
 	"#1971c2",
 	"#9c36b5",
 ];
+
+/** 统一使用笔记正文字体渲染文本标注 */
+let TEXT_FONT_FAMILY = '"Segoe UI", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+
+function setFontFamilyFromCanvas(cv: HTMLCanvasElement): void {
+	const f = getComputedStyle(cv).fontFamily;
+	if (f) TEXT_FONT_FAMILY = f;
+}
+
+function frac(x: number): number {
+	return x - Math.floor(x);
+}
 
 function isVisible(el: HTMLElement): boolean {
 	return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
@@ -249,31 +302,102 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 		return;
 	}
 
-	if (s.erase) {
-		ctx.strokeStyle = "#000";
-		ctx.fillStyle = "#000";
-	} else {
-		ctx.strokeStyle = s.color;
-		ctx.fillStyle = s.color;
+	if (s.text) {
+		// 文本标注：统一笔记字体
+		const p = s.points[0];
+		if (!p || !s.text.trim()) {
+			ctx.restore();
+			return;
+		}
+		const fs = Math.max(12, s.size * 4);
+		if (!s.erase) {
+			ctx.globalAlpha = s.alpha ?? 1;
+			ctx.fillStyle = s.color;
+			ctx.font = `${fs}px ${TEXT_FONT_FAMILY}`;
+			ctx.textBaseline = "top";
+			s.text.split("\n").forEach((ln, i) => ctx.fillText(ln, p.x, p.y + i * fs * 1.35));
+		}
+		ctx.restore();
+		return;
 	}
-	ctx.lineWidth = s.size;
+
+	const brush = s.brush ?? "pen";
+	let alphaMul = 1;
+	if (!s.erase && s.alpha !== undefined) alphaMul = Math.max(0.05, Math.min(1, s.alpha));
+	if (brush === "ball") alphaMul *= 0.92;
+	if (brush === "pencil") alphaMul *= 0.8;
+	ctx.globalAlpha = s.erase ? 1 : alphaMul;
+
+	ctx.lineCap = brush === "marker" || brush === "hl" ? "butt" : "round";
+	const widthMul =
+		brush === "marker" ? 1.6 : brush === "ball" ? 0.85 : brush === "pencil" ? 0.85 : 1;
+	ctx.lineWidth = s.size * widthMul;
+	if (brush === "laser") {
+		ctx.shadowColor = s.color;
+		ctx.shadowBlur = s.size * 2.2;
+	}
+
+	const density = Math.max(0, Math.min(100, s.density ?? 50));
+	const passes = s.erase
+		? 1
+		: brush === "pencil"
+			? 1 + Math.round(density / 40)
+			: brush === "marker" || brush === "hl"
+				? 1 + Math.round(density / 45)
+				: 1;
 
 	const pts = s.points;
-	if (pts.length === 1) {
-		ctx.beginPath();
-		ctx.arc(pts[0].x, pts[0].y, Math.max(0.5, s.size / 2), 0, Math.PI * 2);
-		ctx.fill();
-	} else {
-		ctx.beginPath();
-		ctx.moveTo(pts[0].x, pts[0].y);
-		for (let i = 1; i < pts.length - 1; i++) {
-			const mx = (pts[i].x + pts[i + 1].x) / 2;
-			const my = (pts[i].y + pts[i + 1].y) / 2;
-			ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+
+	// 钢笔：逐段速度感应宽度
+	if (brush === "pen" && !s.erase && s.w && s.w.length === pts.length && pts.length > 1) {
+		for (let i = 1; i < pts.length; i++) {
+			ctx.lineWidth = ((s.w[i - 1] + s.w[i]) / 2) * widthMul;
+			ctx.beginPath();
+			ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+			ctx.lineTo(pts[i].x, pts[i].y);
+			ctx.stroke();
 		}
-		const last = pts[pts.length - 1];
-		ctx.lineTo(last.x, last.y);
-		ctx.stroke();
+		ctx.restore();
+		return;
+	}
+
+	for (let pass = 0; pass < passes; pass++) {
+		if (pass > 0) ctx.globalAlpha = (s.alpha ?? 1) * 0.4;
+		ctx.beginPath();
+		if (pts.length === 1) {
+			ctx.arc(pts[0].x, pts[0].y, Math.max(0.5, ctx.lineWidth / 2), 0, Math.PI * 2);
+			ctx.fillStyle = s.erase ? "#000" : (ctx.strokeStyle);
+			ctx.fill();
+		} else {
+			ctx.moveTo(pts[0].x, pts[0].y);
+			for (let i = 1; i < pts.length - 1; i++) {
+				const mx = (pts[i].x + pts[i + 1].x) / 2;
+				const my = (pts[i].y + pts[i + 1].y) / 2;
+				ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+			}
+			const last = pts[pts.length - 1];
+			ctx.lineTo(last.x, last.y);
+			ctx.stroke();
+		}
+	}
+
+	// 铅笔颗粒（确定性散点，重绘稳定）
+	if (brush === "pencil" && !s.erase && pts.length > 2) {
+		const dots = Math.round((density / 100) * pts.length * 2);
+		ctx.globalAlpha = alphaMul * 0.5;
+		for (let i = 0; i < dots; i++) {
+			const idx = Math.min(
+				pts.length - 1,
+				Math.floor((i / dots) * (pts.length - 1))
+			);
+			const h1 = frac(Math.sin((idx + 1) * 127.1) * 43758.5453);
+			const h2 = frac(Math.sin((idx + 1) * 311.7) * 12543.21);
+			const jx = (h1 - 0.5) * s.size * 0.9;
+			const jy = (h2 - 0.5) * s.size * 0.9;
+			ctx.beginPath();
+			ctx.arc(pts[idx].x + jx, pts[idx].y + jy, Math.max(0.4, s.size * 0.16), 0, Math.PI * 2);
+			ctx.fill();
+		}
 	}
 	ctx.restore();
 }
@@ -326,13 +450,76 @@ function rdpSimplify(pts: Point[], eps: number): Point[] {
  * 笔迹美化：RDP 去抖（自适应阈值）→ 两轮 Chaikin 平滑。
  * 与渲染层的中点平滑不同，这里先移除抖动再拟合，字迹明显更干净。
  */
-function beautifyPoints(pts: Point[]): Point[] {
+function beautifyPoints(pts: Point[], stability = 50): Point[] {
 	if (pts.length < 3) return pts;
-	const eps = Math.min(3, Math.max(1.2, pts.length * 0.008));
+	const eps = Math.min(3, Math.max(1.2, pts.length * 0.008)) * (0.6 + stability / 100);
 	const simplified = rdpSimplify(pts, eps);
 	let cur = chaikinOnce(simplified);
-	cur = chaikinOnce(cur);
+	if (stability >= 40) cur = chaikinOnce(cur);
 	return cur;
+}
+
+
+function countCorners(pts: Point[], minTurnDeg: number): number {
+	if (pts.length < 3) return 0;
+	let c = 0;
+	const rad = (minTurnDeg * Math.PI) / 180;
+	for (let i = 1; i < pts.length - 1; i++) {
+		const ax = pts[i].x - pts[i - 1].x;
+		const ay = pts[i].y - pts[i - 1].y;
+		const bx = pts[i + 1].x - pts[i].x;
+		const by = pts[i + 1].y - pts[i].y;
+		const la = Math.hypot(ax, ay);
+		const lb = Math.hypot(bx, by);
+		if (la < 2 || lb < 2) continue;
+		const dot = (ax * bx + ay * by) / (la * lb);
+		const ang = Math.acos(Math.max(-1, Math.min(1, dot)));
+		if (ang > rad) c++;
+	}
+	return c;
+}
+
+/** 几何自动拟合：开放笔迹→直线（水平/垂直吸附）；闭合笔迹→按角点数判定矩形或椭圆 */
+function fitFreehand(s: Stroke): Stroke | null {
+	if (s.shape || s.erase || s.text || s.points.length < 10) return null;
+	let x0 = Infinity;
+	let y0 = Infinity;
+	let x1 = -Infinity;
+	let y1 = -Infinity;
+	for (const p of s.points) {
+		x0 = Math.min(x0, p.x);
+		y0 = Math.min(y0, p.y);
+		x1 = Math.max(x1, p.x);
+		y1 = Math.max(y1, p.y);
+	}
+	const w = x1 - x0;
+	const h = y1 - y0;
+	const diag = Math.hypot(w, h) || 1;
+	const simp = rdpSimplify(s.points, Math.max(2.4, diag * 0.045));
+	let v = simp.length;
+	const first = simp[0];
+	const last = simp[simp.length - 1];
+	const gap = Math.hypot(first.x - last.x, first.y - last.y);
+	const closed = gap < diag * 0.22;
+	if (closed && v > 2) v--;
+
+	if (!closed) {
+		if (v === 2) {
+			const A = { ...s.points[0] };
+			const B = { ...s.points[s.points.length - 1] };
+			if (Math.abs(B.y - A.y) <= diag * 0.07) B.y = A.y;
+			else if (Math.abs(B.x - A.x) <= diag * 0.07) B.x = A.x;
+			return { ...s, shape: "line", points: [A, B] };
+		}
+		return null;
+	}
+
+	const corners = countCorners(simp, 42);
+	const tl = { x: x0, y: y0 };
+	const br = { x: x1, y: y1 };
+	if (corners >= 3 && corners <= 6)
+		return { ...s, shape: "rect", points: [tl, br] };
+	return { ...s, shape: "ellipse", points: [tl, br] };
 }
 
 /* ---------- 形状几何：轮廓采样 / 命中测试 ---------- */
@@ -440,8 +627,12 @@ function parseStrokes(data: DoodleData | null): Stroke[] {
 					? s.shape
 					: undefined,
 			alpha: typeof s.alpha === "number" ? Math.max(0.05, Math.min(1, s.alpha)) : undefined,
+			brush: (s.brush ?? "pen"),
+			w: Array.isArray(s.w) ? s.w.filter((n) => typeof n === "number" && n > 0) : undefined,
+			text: typeof s.text === "string" ? s.text : undefined,
+			density: typeof s.density === "number" ? Math.max(0, Math.min(100, s.density)) : undefined,
 		}))
-		.filter((s) => s.points.length > 0);
+		.filter((s) => s.points.length > 0 || !!s.text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -496,9 +687,24 @@ class InkOverlay {
 	private popCloser: ((e: MouseEvent) => void) | null = null;
 	private recog: SpeechRecLike | null = null;
 	private recognizing = false;
+	private activeBrush: BrushId = "pen";
+	private cfgSaveT: number | null = null;
+
+	private curBrushId(): BrushId {
+		return brushOf(this.tool.mode) ?? this.activeBrush;
+	}
+
+	private curCfg(): BrushCfg {
+		return this.plugin.settings.brushes[this.curBrushId()];
+	}
+
+	private queueSaveSettings(): void {
+		if (this.cfgSaveT) window.clearTimeout(this.cfgSaveT);
+		this.cfgSaveT = window.setTimeout(() => void this.plugin.saveSettings(), 350);
+	}
 
 	private effSize(): number {
-		return this.tool.mode === "hl" ? Math.max(this.tool.size * 4, 12) : this.tool.size;
+		return this.curCfg().size;
 	}
 
 	private cw = 0;
@@ -638,6 +844,7 @@ class InkOverlay {
 			this.wrap = wrap;
 			this.canvas = canvas;
 			this.ctx = canvas.getContext("2d");
+			setFontFamilyFromCanvas(canvas);
 			this.cw = 0;
 			this.ch = 0;
 
@@ -732,15 +939,39 @@ class InkOverlay {
 		};
 
 		const tools = [
-			{ id: "pen" as const, icon: "pencil", title: "钢笔" },
-			{ id: "hl" as const, icon: "highlighter", title: "荧光笔（半透明）" },
-			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
-			{ id: "erase" as const, icon: "eraser", title: "橡皮：点击选择 像素/整笔擦除" },
+			{ id: "pen" as const, icon: "pen-tool", title: "钢笔（速度感应粗细）" },
+			{ id: "pencil" as const, icon: "pencil", title: "铅笔（颗粒质感）" },
+			{ id: "ball" as const, icon: "pen-line", title: "圆珠笔" },
+			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
+			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
+			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
 		];
 		for (const t of tools) {
 			const b = mkBtn(t.icon, t.title, () => this.onToolClick(t.id));
 			this.toolBtnEls[t.id] = b;
 		}
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
+		this.toolBtnEls["shape"] = mkBtn(
+			"shapes",
+			"形状：直线/箭头/矩形/椭圆/菱形",
+			() => this.openShapePopover(this.toolBtnEls["shape"])
+		);
+		this.toolBtnEls["text"] = mkBtn("type", "文本标注：点击画布插入文字", () =>
+			this.setMode("text")
+		);
+		this.toolBtnEls["erase"] = mkBtn(
+			"eraser",
+			"橡皮：像素 / 整笔擦除",
+			() => this.openErasePopover(this.toolBtnEls["erase"])
+		);
+
+		this.toolBtnEls["fit"] = mkBtn(
+			"ruler",
+			"一键修正：最后一笔拟合为直线/矩形/椭圆",
+			() => this.fitLast()
+		);
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
@@ -771,6 +1002,23 @@ class InkOverlay {
 		doneBtn.addEventListener("click", () => this.plugin.exitAnnotate());
 
 		this.syncTool();
+	}
+
+	private fitLast(): void {
+		const last = this.strokes[this.strokes.length - 1];
+		if (!last) {
+			new Notice("暂无可修正的笔画");
+			return;
+		}
+		const fitted = fitFreehand(last);
+		if (!fitted) {
+			new Notice("最近的笔画无法拟合为规则图形");
+			return;
+		}
+		this.undoStack.push(this.strokes.slice());
+		this.strokes[this.strokes.length - 1] = fitted;
+		this.redraw();
+		this.scheduleSave();
 	}
 
 	private onToolClick(
@@ -863,47 +1111,94 @@ class InkOverlay {
 				else this.syncTool();
 			});
 
+			const bid = this.curBrushId();
+			const cfg = this.plugin.settings.brushes[bid];
+
 			const sizeRow = el.createDiv({ cls: "free-doodle-pop-row" });
-			sizeRow.createSpan({ cls: "free-doodle-pop-label", text: "粗细" });
-			for (const [label, val] of [
-				["细", 2],
-				["中", 5],
-				["粗", 10],
-			] as const) {
-				const b = sizeRow.createEl("button", {
-					cls: "free-doodle-btn free-doodle-wpreset",
-					text: label,
-				});
-				b.dataset.size = String(val);
-				b.addEventListener("click", () => {
-					this.tool.size = val;
-					this.syncTool();
-				});
-				this.widthPresetEls.push(b);
-			}
+			sizeRow.createSpan({ cls: "free-doodle-pop-label", text: "粗细 px" });
+			const sizeSlider = sizeRow.createEl("input", {
+				cls: "free-doodle-slider",
+				type: "range",
+				attr: { min: "1", max: "40", step: "1" },
+			});
+			sizeSlider.value = String(cfg.size);
+			const sizeVal = sizeRow.createSpan({
+				cls: "free-doodle-size-label",
+				text: `${cfg.size} px`,
+			});
+			sizeSlider.addEventListener("input", () => {
+				cfg.size = Number(sizeSlider.value);
+				sizeVal.setText(`${cfg.size} px`);
+				this.syncTool();
+				this.queueSaveSettings();
+			});
 
 			const opRow = el.createDiv({ cls: "free-doodle-pop-row" });
 			opRow.createSpan({ cls: "free-doodle-pop-label", text: "不透明" });
-			this.opacitySliderEl = opRow.createEl("input", {
+			const opSlider = opRow.createEl("input", {
 				cls: "free-doodle-slider",
 				type: "range",
 				attr: { min: "10", max: "100", step: "5" },
 			});
-			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
-			this.opacityLabelEl = opRow.createSpan({
+			opSlider.value = String(Math.round(cfg.opacity * 100));
+			const opVal = opRow.createSpan({
 				cls: "free-doodle-size-label",
-				text: `${Math.round(this.tool.opacity * 100)}%`,
+				text: `${Math.round(cfg.opacity * 100)}%`,
 			});
-			this.opacitySliderEl.addEventListener("input", () => {
-				this.tool.opacity = Number(this.opacitySliderEl.value) / 100;
-				this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
+			opSlider.addEventListener("input", () => {
+				cfg.opacity = Number(opSlider.value) / 100;
+				opVal.setText(`${opSlider.value}%`);
+				this.syncTool();
+				this.queueSaveSettings();
+			});
+
+			if (bid !== "pen") {
+				const deRow = el.createDiv({ cls: "free-doodle-pop-row" });
+				deRow.createSpan({ cls: "free-doodle-pop-label", text: "浓度" });
+				const deSlider = deRow.createEl("input", {
+					cls: "free-doodle-slider",
+					type: "range",
+					attr: { min: "0", max: "100", step: "5" },
+				});
+				deSlider.value = String(Math.round(cfg.density));
+				deSlider.addEventListener("input", () => {
+					cfg.density = Number(deSlider.value);
+					this.queueSaveSettings();
+				});
+			}
+
+			const stRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			stRow.createSpan({ cls: "free-doodle-pop-label", text: "稳定" });
+			const stSlider = stRow.createEl("input", {
+				cls: "free-doodle-slider",
+				type: "range",
+				attr: { min: "0", max: "100", step: "5" },
+			});
+			stSlider.value = String(Math.round(cfg.stability));
+			stSlider.addEventListener("input", () => {
+				cfg.stability = Number(stSlider.value);
+				this.queueSaveSettings();
+			});
+
+			const afRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			afRow.createSpan({ cls: "free-doodle-pop-label", text: "自动拟合" });
+			const afBtn = afRow.createEl("button", {
+				cls: "free-doodle-btn free-doodle-wpreset",
+				text: this.plugin.settings.autoFit ? "开" : "关",
+			});
+			afBtn.toggleClass("is-active", this.plugin.settings.autoFit);
+			afBtn.addEventListener("click", () => {
+				this.plugin.settings.autoFit = !this.plugin.settings.autoFit;
+				afBtn.setText(this.plugin.settings.autoFit ? "开" : "关");
+				afBtn.toggleClass("is-active", this.plugin.settings.autoFit);
+				this.queueSaveSettings();
 			});
 
 			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
-			smRow.createSpan({ cls: "free-doodle-pop-label", text: "优化" });
+			smRow.createSpan({ cls: "free-doodle-pop-label", text: "平滑预览" });
 			const smBtn = smRow.createEl("button", {
 				cls: "free-doodle-btn clickable-icon",
-				attr: { title: "笔迹平滑（去抖动）" },
+				attr: { title: "绘制时实时显示美化后的笔迹" },
 			});
 			setIcon(smBtn, "sparkles");
 			smBtn.toggleClass("is-active", this.smooth);
@@ -1080,6 +1375,11 @@ class InkOverlay {
 		canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
 
+		if (this.tool.mode === "text") {
+			this.beginTextAt(p);
+			return;
+		}
+
 		if (this.tool.mode === "eraseStroke") {
 			this.strokeEraseUndoArmed = true;
 			this.removeStrokesNear(p);
@@ -1087,15 +1387,65 @@ class InkOverlay {
 		}
 
 		const erase = this.tool.mode === "erasePx";
+		const bid = brushOf(this.tool.mode);
+		if (bid) this.activeBrush = bid;
+		const cfg = this.curCfg();
 		this.current = {
 			color: this.tool.color,
-			size: this.effSize(),
+			size: cfg.size,
 			erase,
-			alpha: erase ? undefined : this.tool.opacity,
+			alpha: erase ? undefined : cfg.opacity,
+			density: cfg.density,
+			brush: bid ?? undefined,
+			w: bid === "pen" ? [Math.max(2, cfg.size)] : undefined,
 			points: [p],
 			shape: this.tool.mode === "shape" ? this.shapeKind : undefined,
 		};
 	};
+
+	private beginTextAt(p: Point): void {
+		const content = this.view.contentEl;
+		this.closePopover();
+		const pop = content.createDiv({ cls: "free-doodle-popover free-doodle-text-pop" });
+		this.popover = pop;
+		pop.style.left = `${Math.round(p.x)}px`;
+		pop.style.top = `${Math.round(Math.max(4, p.y - 14))}px`;
+		const input = pop.createEl("input", {
+			cls: "free-doodle-text-input",
+			attr: { placeholder: "输入文字后按回车确认", spellcheck: "false" },
+		});
+		window.setTimeout(() => input.focus(), 30);
+		const commit = () => {
+			const t = input.value.trim();
+			pop.remove();
+			if (this.popover === pop) this.popover = null;
+			if (!t) return;
+			const st: Stroke = {
+				color: this.tool.color,
+				size: this.curCfg().size,
+				erase: false,
+				alpha: this.curCfg().opacity,
+				text: t,
+				points: [p],
+			};
+			this.attachAnchor(st);
+			this.undoStack.push(this.strokes.slice());
+			this.strokes.push(st);
+			this.redraw();
+			this.scheduleSave();
+		};
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") commit();
+			else if (e.key === "Escape") {
+				pop.remove();
+				if (this.popover === pop) this.popover = null;
+			}
+		});
+		pop.createEl("button", { cls: "free-doodle-btn mod-cta", text: "确定" }).addEventListener(
+			"click",
+			commit
+		);
+	}
 
 	private strokeEraseUndoArmed = false;
 
@@ -1150,7 +1500,7 @@ class InkOverlay {
 			let draw = s;
 			// 拖动中实时预览美化结果（自由笔迹 + 开启优化时）
 			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
-				draw = { ...s, points: beautifyPoints(s.points) };
+				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
 			}
 			this.redraw();
 			drawStroke(ctx, draw);
@@ -1170,7 +1520,15 @@ class InkOverlay {
 		if (s.shape) {
 			s.points[1] = this.toPoint(evt);
 		} else {
-			s.points.push(this.toPoint(evt));
+			const prev = s.points[s.points.length - 1];
+			const cur = this.toPoint(evt);
+			s.points.push(cur);
+			if (s.brush === "pen" && s.w) {
+				// 速度感应宽度：越慢越粗
+				const speed = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+				const base = this.curCfg().size;
+				s.w.push(Math.max(base * 0.45, Math.min(base * 1.5, base * (1.45 - speed * 0.03))));
+			}
 		}
 		this.schedulePreview();
 	};
@@ -1187,10 +1545,16 @@ class InkOverlay {
 			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
 		}
 
-		// 笔迹优化：自由笔迹做去抖 + 平滑拟合
+		// 笔迹优化：去抖 + 平滑拟合（强度由稳定性参数决定）
 		let final: Stroke = s;
 		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
-			final = { ...s, points: beautifyPoints(s.points) };
+			final = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
+		}
+
+		// 自动几何拟合
+		if (this.plugin.settings.autoFit) {
+			const fitted = fitFreehand(final);
+			if (fitted) final = fitted;
 		}
 
 		this.attachAnchor(final);
@@ -1490,6 +1854,10 @@ class InkOverlay {
 				ry: s.ry !== undefined ? Math.round(s.ry) : undefined,
 				shape: s.shape,
 				alpha: s.alpha,
+				brush: s.brush,
+				w: s.w,
+				text: s.text,
+				density: s.density,
 			})),
 		};
 	}
@@ -1549,9 +1917,40 @@ class InkOverlay {
 /* 独立涂鸦画板视图                                                    */
 /* ------------------------------------------------------------------ */
 
-type BoardTool = "pen" | "hl" | "shape" | "erasePx" | "eraseStroke";
+type BoardTool = ToolMode;
 
-type ToolMode = "pen" | "hl" | "shape" | "erasePx" | "eraseStroke";
+type ToolMode =
+	| "pen"
+	| "pencil"
+	| "ball"
+	| "marker"
+	| "hl"
+	| "laser"
+	| "text"
+	| "shape"
+	| "erasePx"
+	| "eraseStroke";
+
+type BrushId = "pen" | "pencil" | "ball" | "marker" | "hl" | "laser";
+
+function brushOf(mode: ToolMode): BrushId | null {
+	switch (mode) {
+		case "pen":
+			return "pen";
+		case "pencil":
+			return "pencil";
+		case "ball":
+			return "ball";
+		case "marker":
+			return "marker";
+		case "hl":
+			return "hl";
+		case "laser":
+			return "laser";
+		default:
+			return null;
+	}
+}
 
 type ShapeKind = "rect" | "ellipse";
 
@@ -1603,6 +2002,7 @@ class DoodleView extends ItemView {
 	private size: number;
 	private opacity = 1;
 	private mode: BoardTool = "pen";
+	private activeBrush: BrushId = "pen";
 
 	private smooth = true;
 	private popover: HTMLElement | null = null;
@@ -1628,7 +2028,15 @@ class DoodleView extends ItemView {
 	private toolBtnEls: Record<string, HTMLElement> = {};
 
 	private effSize(): number {
-		return this.mode === "hl" ? Math.max(this.size * 4, 12) : this.size;
+		return this.curCfg().size;
+	}
+
+	private curBrushId(): BrushId {
+		return brushOf(this.mode) ?? this.activeBrush;
+	}
+
+	private curCfg(): BrushCfg {
+		return this.plugin.settings.brushes[this.curBrushId()];
 	}
 
 	constructor(leaf: WorkspaceLeaf, plugin: FreeDoodlePlugin) {
@@ -1662,6 +2070,7 @@ class DoodleView extends ItemView {
 		const wrap = root.createDiv({ cls: "free-doodle-canvas-wrap" });
 		this.canvas = wrap.createEl("canvas", { cls: "free-doodle-canvas free-doodle-board" });
 		this.ctx = this.canvas.getContext("2d")!;
+		setFontFamilyFromCanvas(this.canvas);
 		this.resizeCanvas();
 
 		this.ro = new ResizeObserver(() => this.resizeCanvas());
@@ -1710,19 +2119,20 @@ class DoodleView extends ItemView {
 		};
 
 		const tools = [
-			{ id: "pen" as const, icon: "pencil", title: "钢笔" },
-			{ id: "hl" as const, icon: "highlighter", title: "荧光笔（半透明）" },
-			{ id: "shape" as const, icon: "square", title: "形状：点击切换 矩形/椭圆" },
-			{ id: "erase" as const, icon: "eraser", title: "橡皮：点击切换 像素/整笔擦除" },
+			{ id: "pen" as const, icon: "pen-tool", title: "钢笔（速度感应粗细）" },
+			{ id: "pencil" as const, icon: "pencil", title: "铅笔（颗粒质感）" },
+			{ id: "ball" as const, icon: "pen-line", title: "圆珠笔" },
+			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
+			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
+			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
+			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
+			{ id: "text" as const, icon: "type", title: "文本标注：点击画布插入文字" },
+			{ id: "erase" as const, icon: "eraser", title: "橡皮：像素 / 整笔擦除" },
 		];
 		for (const t of tools) {
-			const b = toolbar.createEl("button", {
-				cls: "free-doodle-btn clickable-icon",
-				attr: { title: t.title },
-			});
-			setIcon(b, t.icon);
-			b.addEventListener("click", () => this.onBoardToolClick(t.id));
-			this.toolBtnEls[t.id] = b;
+			this.toolBtnEls[t.id] = mkBtn(t.icon, t.title, () =>
+				this.onBoardToolClick(t.id)
+			);
 		}
 
 		toolbar.createDiv({ cls: "free-doodle-sep" });
@@ -2019,6 +2429,11 @@ class DoodleView extends ItemView {
 		this.canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
 
+		if (this.mode === "text") {
+			this.beginBoardTextAt(p);
+			return;
+		}
+
 		if (this.mode === "eraseStroke") {
 			this.strokeEraseUndoArmed = true;
 			this.removeStrokesNear(p);
@@ -2026,14 +2441,60 @@ class DoodleView extends ItemView {
 		}
 
 		const erase = this.mode === "erasePx";
+		const bid = brushOf(this.mode);
+		if (bid) this.activeBrush = bid;
+		const cfg = this.curCfg();
 		this.current = {
 			color: this.color,
-			size: this.effSize(),
+			size: cfg.size,
 			erase,
-			alpha: erase ? undefined : this.opacity,
+			alpha: erase ? undefined : cfg.opacity,
+			density: cfg.density,
+			brush: bid ?? undefined,
+			w: bid === "pen" ? [Math.max(2, cfg.size)] : undefined,
 			points: [p],
 			shape: this.mode === "shape" ? this.shapeKind : undefined,
 		};
+	}
+	private beginBoardTextAt(p: Point): void {
+		this.closePopover();
+		const pop = this.contentEl.createDiv({ cls: "free-doodle-popover free-doodle-text-pop" });
+		this.popover = pop;
+		pop.style.left = `${Math.round(p.x)}px`;
+		pop.style.top = `${Math.round(Math.max(4, p.y - 14))}px`;
+		const input = pop.createEl("input", {
+			cls: "free-doodle-text-input",
+			attr: { placeholder: "输入文字后按回车确认", spellcheck: "false" },
+		});
+		window.setTimeout(() => input.focus(), 30);
+		const commit = () => {
+			const t = input.value.trim();
+			pop.remove();
+			if (this.popover === pop) this.popover = null;
+			if (!t) return;
+			const st: Stroke = {
+				color: this.color,
+				size: this.curCfg().size,
+				erase: false,
+				alpha: this.curCfg().opacity,
+				text: t,
+				points: [p],
+			};
+			this.pushUndo();
+			this.strokes.push(st);
+			this.redraw();
+		};
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") commit();
+			else if (e.key === "Escape") {
+				pop.remove();
+				if (this.popover === pop) this.popover = null;
+			}
+		});
+		pop.createEl("button", { cls: "free-doodle-btn mod-cta", text: "确定" }).addEventListener(
+			"click",
+			commit
+		);
 	}
 
 	private strokeEraseUndoArmed = false;
@@ -2080,7 +2541,7 @@ class DoodleView extends ItemView {
 			if (!s || !this.ctx || !this.containerEl.isConnected) return;
 			let draw = s;
 			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
-				draw = { ...s, points: beautifyPoints(s.points) };
+				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
 			}
 			this.redraw();
 			drawStroke(this.ctx, draw);
@@ -2100,7 +2561,14 @@ class DoodleView extends ItemView {
 		if (s.shape) {
 			s.points[1] = this.toPoint(evt);
 		} else {
-			s.points.push(this.toPoint(evt));
+			const prev = s.points[s.points.length - 1];
+			const cur = this.toPoint(evt);
+			s.points.push(cur);
+			if (s.brush === "pen" && s.w) {
+				const speed = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+				const base = this.curCfg().size;
+				s.w.push(Math.max(base * 0.45, Math.min(base * 1.5, base * (1.45 - speed * 0.03))));
+			}
 		}
 		this.schedulePreview();
 	}
@@ -2118,7 +2586,12 @@ class DoodleView extends ItemView {
 
 		let final: Stroke = s;
 		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
-			final = { ...s, points: beautifyPoints(s.points) };
+			final = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
+		}
+
+		if (this.plugin.settings.autoFit) {
+			const fitted = fitFreehand(final);
+			if (fitted) final = fitted;
 		}
 
 		this.pushUndo();
@@ -2293,6 +2766,15 @@ export default class FreeDoodlePlugin extends Plugin {
 	async loadSettings(): Promise<void> {
 		const stored = (await this.loadData()) as Partial<FreeDoodleSettings> | null;
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, stored ?? {});
+		const bStored = (stored?.brushes ?? {}) as Partial<
+			Record<BrushId, Partial<BrushCfg>>
+		>;
+		this.settings.brushes = defaultBrushes();
+		for (const id of BRUSH_IDS) {
+			const o = bStored[id];
+			if (o) this.settings.brushes[id] = { ...defaultBrushes()[id], ...o };
+		}
+		if (typeof this.settings.autoFit !== "boolean") this.settings.autoFit = true;
 	}
 
 	async saveSettings(): Promise<void> {
@@ -2490,6 +2972,16 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
+			.setName("自动拟合图形")
+			.setDesc("随手画的闭合图形自动修正为规则形状（直线/矩形/椭圆）")
+			.addToggle((tb) =>
+				tb.setValue(this.plugin.settings.autoFit).onChange(async (v) => {
+					this.plugin.settings.autoFit = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(containerEl)
 			.setName("独立画板图片文件夹")
 			.setDesc("仅用于独立画板导出 PNG 的存放路径（库内相对路径），不存在时自动创建")
 			.addText((tb) =>
@@ -2533,10 +3025,8 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
-		const generalGroup: SettingDefinitionItem = {
-			type: "group",
-			heading: "Annotate / 涂鸦",
-			items: [
+		const generalItems: SettingDefinition<string>[] = [
+
 				{
 					name: "Default pen color 默认画笔颜色",
 					desc: "Initial color when entering annotate mode. 进入涂鸦模式时的初始颜色。",
@@ -2575,7 +3065,21 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 						void this.plugin.activateBoard();
 					},
 				},
-			],
+				{
+					name: "Auto fit shapes 自动拟合图形",
+					desc: "Freehand closed shapes snap to perfect geometry. 手绘闭合图形自动修正。",
+					control: {
+						type: "toggle",
+						key: "autoFit",
+						defaultValue: true,
+					},
+				},
+			];
+
+		const generalGroup: SettingDefinitionGroup = {
+			type: "group",
+			heading: "Annotate / 涂鸦",
+			items: generalItems,
 		};
 		const diagnostics: SettingDefinition = {
 			name: "Diagnostics 诊断日志",
