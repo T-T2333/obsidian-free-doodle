@@ -914,8 +914,10 @@ class InkOverlay {
 		const dpr = Math.min(window.devicePixelRatio || 1, 2);
 		canvas.width = Math.floor(w * dpr);
 		canvas.height = Math.floor(h * dpr);
-		canvas.style.width = `${w}px`;
-		canvas.style.height = `${h}px`;
+		canvas.setCssStyles({
+			width: `${w}px`,
+			height: `${h}px`,
+		});
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		this.rebuildBase();
 		this.paint();
@@ -942,7 +944,7 @@ class InkOverlay {
 		const tools = [
 			{ id: "pen" as const, icon: "pen-tool", title: "钢笔（速度感应粗细）" },
 			{ id: "pencil" as const, icon: "pencil", title: "铅笔（颗粒质感）" },
-			{ id: "ball" as const, icon: "pen-line", title: "圆珠笔" },
+			{ id: "ball" as const, icon: "pen", title: "圆珠笔" },
 			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
 			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
 			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
@@ -1069,8 +1071,23 @@ class InkOverlay {
 		build(pop);
 		const aRect = anchor.getBoundingClientRect();
 		const cRect = content.getBoundingClientRect();
-		pop.style.left = `${Math.max(4, Math.round(aRect.left - cRect.left))}px`;
-		pop.style.top = `${Math.round(aRect.bottom - cRect.top + 6)}px`;
+		pop.setCssStyles({
+			left: "0px",
+			top: "0px",
+			visibility: "hidden",
+		});
+		const pw = pop.offsetWidth || 240;
+		const ph = pop.offsetHeight || 140;
+		let left = Math.max(4, Math.round(aRect.left - cRect.left));
+		if (left + pw > cRect.width - 6) left = Math.max(4, cRect.width - pw - 6);
+		let top = aRect.bottom - cRect.top + 6;
+		if (top + ph > cRect.height - 6)
+			top = Math.max(4, Math.max(0, aRect.top - cRect.top - ph - 6));
+		pop.setCssStyles({
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+			visibility: "visible",
+		});
 		const closer = (e: MouseEvent) => {
 			const t = e.target as Node;
 			if (this.popover && !this.popover.contains(t) && !anchor.contains(t)) {
@@ -1093,6 +1110,7 @@ class InkOverlay {
 					attr: { title: c },
 				});
 				b.dataset.color = c;
+				b.setCssStyles({ backgroundColor: c });
 				b.addEventListener("click", () => {
 					this.tool.color = c;
 					if (this.isEraseMode()) this.setMode("pen");
@@ -1409,8 +1427,10 @@ class InkOverlay {
 		this.closePopover();
 		const pop = content.createDiv({ cls: "free-doodle-popover free-doodle-text-pop" });
 		this.popover = pop;
-		pop.style.left = `${Math.round(p.x)}px`;
-		pop.style.top = `${Math.round(Math.max(4, p.y - 14))}px`;
+		pop.setCssStyles({
+			left: `${Math.round(p.x)}px`,
+			top: `${Math.round(Math.max(4, p.y - 14))}px`,
+		});
 		const input = pop.createEl("input", {
 			cls: "free-doodle-text-input",
 			attr: { placeholder: "输入文字后按回车确认", spellcheck: "false" },
@@ -1490,6 +1510,15 @@ class InkOverlay {
 		return removed;
 	}
 
+	private stabilizedForPreview(s: Stroke): Stroke {
+		if (!this.smooth || s.erase || s.shape) return s;
+		const pts = s.points;
+		if (pts.length < 10 || pts.length > 1200) return s;
+		const cut = Math.max(0, pts.length - 10);
+		const head = beautifyPoints(pts.slice(0, cut + 1), this.curCfg().stability, 1);
+		return { ...s, points: [...head, ...pts.slice(cut + 1)] };
+	}
+
 	private schedulePreview(): void {
 		if (this.previewScheduled) return;
 		this.previewScheduled = true;
@@ -1498,20 +1527,8 @@ class InkOverlay {
 			const s = this.current;
 			const ctx = this.ctx;
 			if (!s || !ctx || this.destroyed) return;
-			let draw = s;
-			// 拖动中实时预览美化（限长防卡顿；提交时始终全量美化）
-			if (
-				!s.erase &&
-				!s.shape &&
-				this.smooth &&
-				s.points.length > 6 &&
-				s.points.length < 1200
-			) {
-				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability, 1) };
-			}
-			// 每帧仅贴图 + 当前笔迹，已提交墨迹在离屏缓存中
 			this.paint();
-			drawStroke(ctx, draw);
+			drawStroke(ctx, this.stabilizedForPreview(s));
 		});
 	}
 
@@ -1609,7 +1626,7 @@ class InkOverlay {
 	private rebuildBase(): void {
 		if (this.destroyed || !this.canvas) return;
 		if (!this.baseCanvas || !this.baseCtx) {
-			this.baseCanvas = document.createElement("canvas");
+			this.baseCanvas = createEl("canvas");
 			this.baseCtx = this.baseCanvas.getContext("2d");
 		}
 		const bc = this.baseCanvas;
@@ -2161,7 +2178,7 @@ class DoodleView extends ItemView {
 		const tools = [
 			{ id: "pen" as const, icon: "pen-tool", title: "钢笔（速度感应粗细）" },
 			{ id: "pencil" as const, icon: "pencil", title: "铅笔（颗粒质感）" },
-			{ id: "ball" as const, icon: "pen-line", title: "圆珠笔" },
+			{ id: "ball" as const, icon: "pen", title: "圆珠笔" },
 			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
 			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
 			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
@@ -2261,8 +2278,23 @@ class DoodleView extends ItemView {
 		build(pop);
 		const aRect = anchor.getBoundingClientRect();
 		const cRect = content.getBoundingClientRect();
-		pop.style.left = `${Math.max(4, Math.round(aRect.left - cRect.left))}px`;
-		pop.style.top = `${Math.round(aRect.bottom - cRect.top + 6)}px`;
+		pop.setCssStyles({
+			left: "0px",
+			top: "0px",
+			visibility: "hidden",
+		});
+		const pw = pop.offsetWidth || 240;
+		const ph = pop.offsetHeight || 140;
+		let left = Math.max(4, Math.round(aRect.left - cRect.left));
+		if (left + pw > cRect.width - 6) left = Math.max(4, cRect.width - pw - 6);
+		let top = aRect.bottom - cRect.top + 6;
+		if (top + ph > cRect.height - 6)
+			top = Math.max(4, Math.max(0, aRect.top - cRect.top - ph - 6));
+		pop.setCssStyles({
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+			visibility: "visible",
+		});
 		const closer = (e: MouseEvent) => {
 			const t = e.target as Node;
 			if (this.popover && !this.popover.contains(t) && !anchor.contains(t)) {
@@ -2285,6 +2317,7 @@ class DoodleView extends ItemView {
 					attr: { title: c },
 				});
 				b.dataset.color = c;
+				b.setCssStyles({ backgroundColor: c });
 				b.addEventListener("click", () => {
 					this.color = c;
 					if (this.mode === "erasePx" || this.mode === "eraseStroke")
@@ -2573,6 +2606,15 @@ class DoodleView extends ItemView {
 		}
 	}
 
+	private stabilizedForPreview(s: Stroke): Stroke {
+		if (!this.smooth || s.erase || s.shape) return s;
+		const pts = s.points;
+		if (pts.length < 10 || pts.length > 1200) return s;
+		const cut = Math.max(0, pts.length - 10);
+		const head = beautifyPoints(pts.slice(0, cut + 1), this.curCfg().stability, 1);
+		return { ...s, points: [...head, ...pts.slice(cut + 1)] };
+	}
+
 	private schedulePreview(): void {
 		if (this.previewScheduled) return;
 		this.previewScheduled = true;
@@ -2580,18 +2622,8 @@ class DoodleView extends ItemView {
 			this.previewScheduled = false;
 			const s = this.current;
 			if (!s || !this.ctx || !this.containerEl.isConnected) return;
-			let draw = s;
-			if (
-				!s.erase &&
-				!s.shape &&
-				this.smooth &&
-				s.points.length > 6 &&
-				s.points.length < 1200
-			) {
-				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability, 1) };
-			}
 			this.paint();
-			drawStroke(this.ctx, draw);
+			drawStroke(this.ctx, this.stabilizedForPreview(s));
 		});
 	}
 
@@ -2651,7 +2683,7 @@ class DoodleView extends ItemView {
 
 	private rebuildBase(): void {
 		if (!this.baseCanvas || !this.baseCtx) {
-			this.baseCanvas = document.createElement("canvas");
+			this.baseCanvas = createEl("canvas");
 			this.baseCtx = this.baseCanvas.getContext("2d");
 		}
 		const bc = this.baseCanvas;
