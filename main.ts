@@ -47,7 +47,7 @@ interface Stroke {
 	erase: boolean;
 	points: Point[];
 	/** 形状：矩形 / 椭圆（points 为 [起点, 终点]） */
-	shape?: "rect" | "ellipse";
+	shape?: DrawShape;
 	/** 不透明度 0.1 - 1，仅非擦除笔生效 */
 	alpha?: number;
 	/** 文字块指纹（所在段落/行的规范化文本前 80 字符） */
@@ -64,7 +64,7 @@ interface StoredStroke {
 	size: number;
 	erase: boolean;
 	pts: number[][];
-	shape?: "rect" | "ellipse";
+	shape?: DrawShape;
 	alpha?: number;
 	k?: string;
 	o?: number;
@@ -179,7 +179,7 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 	ctx.lineCap = "round";
 	ctx.lineJoin = "round";
 
-	if (s.shape === "rect" || s.shape === "ellipse") {
+	if (s.shape === "rect" || s.shape === "ellipse" || s.shape === "diamond") {
 		const a = s.points[0];
 		const b = s.points[s.points.length - 1];
 		if (!a || !b) {
@@ -194,12 +194,18 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 			const w = Math.abs(b.x - a.x);
 			const h = Math.abs(b.y - a.y);
 			ctx.rect(x, y, w, h);
-		} else {
+		} else if (s.shape === "ellipse") {
 			const cx = (a.x + b.x) / 2;
 			const cy = (a.y + b.y) / 2;
 			const rx = Math.max(Math.abs(b.x - a.x) / 2, 0.5);
 			const ry = Math.max(Math.abs(b.y - a.y) / 2, 0.5);
 			ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+		} else {
+			ctx.moveTo((a.x + b.x) / 2, a.y);
+			ctx.lineTo(b.x, (a.y + b.y) / 2);
+			ctx.lineTo((a.x + b.x) / 2, b.y);
+			ctx.lineTo(a.x, (a.y + b.y) / 2);
+			ctx.closePath();
 		}
 		if (s.erase) {
 			ctx.fillStyle = "#000";
@@ -208,6 +214,37 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 			ctx.strokeStyle = s.color;
 			ctx.stroke();
 		}
+		ctx.restore();
+		return;
+	}
+
+	if (s.shape === "line" || s.shape === "arrow") {
+		const a = s.points[0];
+		const b = s.points[s.points.length - 1];
+		if (!a || !b) {
+			ctx.restore();
+			return;
+		}
+		ctx.lineWidth = s.size;
+		ctx.strokeStyle = s.erase ? "#000" : s.color;
+		ctx.beginPath();
+		ctx.moveTo(a.x, a.y);
+		ctx.lineTo(b.x, b.y);
+		if (s.shape === "arrow") {
+			const ang = Math.atan2(b.y - a.y, b.x - a.x);
+			const head = Math.max(12, s.size * 3);
+			ctx.moveTo(b.x, b.y);
+			ctx.lineTo(
+				b.x - head * Math.cos(ang - Math.PI / 7),
+				b.y - head * Math.sin(ang - Math.PI / 7)
+			);
+			ctx.moveTo(b.x, b.y);
+			ctx.lineTo(
+				b.x - head * Math.cos(ang + Math.PI / 7),
+				b.y - head * Math.sin(ang + Math.PI / 7)
+			);
+		}
+		ctx.stroke();
 		ctx.restore();
 		return;
 	}
@@ -245,6 +282,116 @@ function drawStrokes(ctx: CanvasRenderingContext2D, strokes: Stroke[]): void {
 	for (const s of strokes) drawStroke(ctx, s);
 }
 
+/* ---------- 笔迹美化（去抖 + 平滑拟合） ---------- */
+
+function chaikinOnce(pts: Point[]): Point[] {
+	if (pts.length < 3) return pts;
+	const out: Point[] = [pts[0]];
+	for (let i = 0; i < pts.length - 1; i++) {
+		const p = pts[i];
+		const q = pts[i + 1];
+		out.push({ x: p.x * 0.75 + q.x * 0.25, y: p.y * 0.75 + q.y * 0.25 });
+		out.push({ x: p.x * 0.25 + q.x * 0.75, y: p.y * 0.25 + q.y * 0.75 });
+	}
+	out.push(pts[pts.length - 1]);
+	return out;
+}
+
+/** 折线美化：合并抖动点 → 两轮 Chaikin 平滑，保留端点 */
+function beautifyPoints(pts: Point[]): Point[] {
+	if (pts.length < 3) return pts;
+	const dense: Point[] = [pts[0]];
+	for (let i = 1; i < pts.length; i++) {
+		const prev = dense[dense.length - 1];
+		const q = pts[i];
+		if (Math.hypot(q.x - prev.x, q.y - prev.y) > 0.8) dense.push(q);
+	}
+	if (dense.length < 3) return pts;
+	let cur = chaikinOnce(dense);
+	cur = chaikinOnce(cur);
+	return cur;
+}
+
+/* ---------- 形状几何：轮廓采样 / 命中测试 ---------- */
+
+function shapeOutline(s: Stroke): { pts: Point[]; closed: boolean } {
+	const a = s.points[0];
+	const b = s.points[s.points.length - 1];
+	switch (s.shape) {
+		case "rect":
+			return {
+				pts: [a, { x: b.x, y: a.y }, b, { x: a.x, y: b.y }],
+				closed: true,
+			};
+		case "diamond":
+			return {
+				pts: [
+					{ x: (a.x + b.x) / 2, y: a.y },
+					{ x: b.x, y: (a.y + b.y) / 2 },
+					{ x: (a.x + b.x) / 2, y: b.y },
+					{ x: a.x, y: (a.y + b.y) / 2 },
+				],
+				closed: true,
+			};
+		case "ellipse": {
+			const cx = (a.x + b.x) / 2;
+			const cy = (a.y + b.y) / 2;
+			const rx = Math.abs(b.x - a.x) / 2;
+			const ry = Math.abs(b.y - a.y) / 2;
+			const pts: Point[] = [];
+			for (let i = 0; i < 24; i++) {
+				const t = (i / 24) * Math.PI * 2;
+				pts.push({ x: cx + rx * Math.cos(t), y: cy + ry * Math.sin(t) });
+			}
+			return { pts, closed: true };
+		}
+		default:
+			return { pts: [a, b], closed: false };
+	}
+}
+
+function distToSeg(
+	px: number,
+	py: number,
+	a: Point,
+	b: Point
+): number {
+	const dx = b.x - a.x;
+	const dy = b.y - a.y;
+	const len2 = dx * dx + dy * dy;
+	const t = len2 === 0 ? 0 : ((px - a.x) * dx + (py - a.y) * dy) / len2;
+	const ct = Math.max(0, Math.min(1, t));
+	return Math.hypot(px - (a.x + ct * dx), py - (a.y + ct * dy));
+}
+
+function hitShapeOrPath(s: Stroke, px: number, py: number, th: number): boolean {
+	if (!s.shape || s.points.length < 2) {
+		for (const q of s.points) {
+			if (Math.hypot(q.x - px, q.y - py) <= th) return true;
+		}
+		return false;
+	}
+	const { pts, closed } = shapeOutline(s);
+	for (let i = 0; i < pts.length - (closed ? 0 : 1); i++) {
+		const a = pts[i];
+		const b = pts[(i + 1) % pts.length];
+		if (distToSeg(px, py, a, b) <= th) return true;
+	}
+	if (!closed) return false;
+	// 内部命中
+	let inside = false;
+	for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+		const xi = pts[i].x;
+		const yi = pts[i].y;
+		const xj = pts[j].x;
+		const yj = pts[j].y;
+		if (yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) {
+			inside = !inside;
+		}
+	}
+	return inside;
+}
+
 function parseStrokes(data: DoodleData | null): Stroke[] {
 	if (!data || !Array.isArray(data.strokes)) return [];
 	return data.strokes
@@ -261,7 +408,14 @@ function parseStrokes(data: DoodleData | null): Stroke[] {
 			o: typeof s.o === "number" ? s.o : undefined,
 			rx: typeof s.rx === "number" ? s.rx : undefined,
 			ry: typeof s.ry === "number" ? s.ry : undefined,
-			shape: s.shape === "rect" || s.shape === "ellipse" ? s.shape : undefined,
+			shape:
+				s.shape === "rect" ||
+				s.shape === "ellipse" ||
+				s.shape === "line" ||
+				s.shape === "arrow" ||
+				s.shape === "diamond"
+					? s.shape
+					: undefined,
 			alpha: typeof s.alpha === "number" ? Math.max(0.05, Math.min(1, s.alpha)) : undefined,
 		}))
 		.filter((s) => s.points.length > 0);
@@ -299,7 +453,7 @@ class InkOverlay {
 		mode: "pen" as ToolMode,
 	};
 
-	private shapeKind: ShapeKind = "rect";
+	private shapeKind: DrawShape = "rect";
 	private eraseKind: EraseKind = "px";
 	private previewScheduled = false;
 
@@ -310,6 +464,15 @@ class InkOverlay {
 	private opacitySliderEl!: HTMLInputElement;
 	private opacityLabelEl!: HTMLElement;
 	private toolBtnEls: Record<string, HTMLElement> = {};
+	private styleBtnEl!: HTMLElement;
+	private micBtnEl!: HTMLElement;
+	private widthPresetEls: HTMLElement[] = [];
+
+	private smooth = true;
+	private popover: HTMLElement | null = null;
+	private popCloser: ((e: MouseEvent) => void) | null = null;
+	private recog: SpeechRecLike | null = null;
+	private recognizing = false;
 
 	private effSize(): number {
 		return this.tool.mode === "hl" ? Math.max(this.tool.size * 4, 12) : this.tool.size;
@@ -366,6 +529,12 @@ class InkOverlay {
 		this.mo = undefined;
 		this.ro?.disconnect();
 		this.ro = undefined;
+		this.closePopover();
+		try {
+			this.recog?.stop();
+		} catch {
+			/* 忽略停止失败 */
+		}
 		if (this.timer !== null) window.clearInterval(this.timer);
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.removeEscListener();
@@ -518,6 +687,49 @@ class InkOverlay {
 		const tb = this.view.contentEl.createDiv({ cls: "free-doodle-floatbar" });
 		this.toolbar = tb;
 
+		const mkBtn = (
+			icon: string,
+			title: string,
+			onClick: () => void,
+			cls = "free-doodle-btn clickable-icon"
+		): HTMLButtonElement => {
+			const b = tb.createEl("button", { cls, attr: { title } });
+			setIcon(b, icon);
+			b.addEventListener("click", onClick);
+			return b;
+		};
+
+		const tools = [
+			{ id: "pen" as const, icon: "pencil", title: "钢笔" },
+			{ id: "hl" as const, icon: "highlighter", title: "荧光笔（半透明）" },
+			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
+			{ id: "erase" as const, icon: "eraser", title: "橡皮：点击选择 像素/整笔擦除" },
+		];
+		for (const t of tools) {
+			const b = mkBtn(t.icon, t.title, () => this.onToolClick(t.id));
+			this.toolBtnEls[t.id] = b;
+		}
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
+		this.styleBtnEl = mkBtn("settings-2", "样式：颜色 / 粗细 / 不透明度 / 笔迹优化", () =>
+			this.openStylePopover(this.styleBtnEl)
+		);
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
+		if (SpeechCapable()) {
+			this.micBtnEl = mkBtn("mic", "语音转文字（插入到当前笔记）", () =>
+				this.toggleVoice()
+			);
+			this.toolBtnEls["mic"] = this.micBtnEl;
+		}
+
+		this.toolBtnEls["undo"] = mkBtn("undo-2", "撤销 (Ctrl+Z)", () => this.undo());
+		this.toolBtnEls["trash"] = mkBtn("trash-2", "清空全部墨迹", () => this.clearAll());
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
 		const doneBtn = tb.createEl("button", {
 			cls: "free-doodle-btn mod-cta",
 			attr: { title: "完成并保存" },
@@ -526,120 +738,196 @@ class InkOverlay {
 		doneBtn.createSpan({ text: "完成" });
 		doneBtn.addEventListener("click", () => this.plugin.exitAnnotate());
 
-		tb.createDiv({ cls: "free-doodle-sep" });
-
-		for (const c of PALETTE) {
-			const b = tb.createEl("button", {
-				cls: "free-doodle-swatch",
-				attr: { title: c },
-			});
-			b.style.backgroundColor = c;
-			b.addEventListener("click", () => {
-				this.tool.color = c;
-				if (this.isEraseMode()) this.setMode("pen");
-				else this.syncTool();
-			});
-			this.swatchEls.push(b);
-		}
-
-		this.colorInputEl = tb.createEl("input", {
-			cls: "free-doodle-color-input",
-			type: "color",
-			attr: { title: "自定义颜色" },
-		});
-		this.colorInputEl.value = this.tool.color;
-		this.colorInputEl.addEventListener("input", () => {
-			this.tool.color = this.colorInputEl.value;
-			if (this.isEraseMode()) this.setMode("pen");
-			else this.syncTool();
-		});
-
-		tb.createDiv({ cls: "free-doodle-sep" });
-
-		this.sizeSliderEl = tb.createEl("input", {
-			cls: "free-doodle-slider",
-			type: "range",
-			attr: { min: "1", max: "40", step: "1", title: "粗细（像素）" },
-		});
-		this.sizeSliderEl.value = String(this.tool.size);
-		this.sizeLabelEl = tb.createSpan({
-			cls: "free-doodle-size-label",
-			text: `${this.effSize()} px`,
-		});
-		this.sizeSliderEl.addEventListener("input", () => {
-			this.tool.size = Number(this.sizeSliderEl.value);
-			this.sizeLabelEl.setText(`${this.effSize()} px`);
-		});
-
-		tb.createDiv({ cls: "free-doodle-sep" });
-
-		this.opacitySliderEl = tb.createEl("input", {
-			cls: "free-doodle-slider free-doodle-opacity",
-			type: "range",
-			attr: { min: "10", max: "100", step: "5", title: "不透明度" },
-		});
-		this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
-		this.opacityLabelEl = tb.createSpan({
-			cls: "free-doodle-size-label",
-			text: `${Math.round(this.tool.opacity * 100)}%`,
-		});
-		this.opacitySliderEl.addEventListener("input", () => {
-			this.tool.opacity = Number(this.opacitySliderEl.value) / 100;
-			this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
-		});
-
-		tb.createDiv({ cls: "free-doodle-sep" });
-
-		const tools = [
-			{ id: "pen" as const, icon: "pencil", title: "钢笔" },
-			{ id: "hl" as const, icon: "highlighter", title: "荧光笔（半透明）" },
-			{ id: "shape" as const, icon: "square", title: "形状：点击切换 矩形/椭圆" },
-			{ id: "erase" as const, icon: "eraser", title: "橡皮：点击切换 像素/整笔擦除" },
-		];
-		for (const t of tools) {
-			const b = tb.createEl("button", {
-				cls: "free-doodle-btn clickable-icon",
-				attr: { title: t.title },
-			});
-			setIcon(b, t.icon);
-			b.addEventListener("click", () => this.onToolClick(t.id));
-			this.toolBtnEls[t.id] = b;
-		}
-
-		const undoBtn = tb.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "撤销 (Ctrl+Z)" },
-		});
-		setIcon(undoBtn, "undo-2");
-		undoBtn.addEventListener("click", () => this.undo());
-
-		const clearBtn = tb.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "清空全部墨迹" },
-		});
-		setIcon(clearBtn, "trash-2");
-		clearBtn.addEventListener("click", () => this.clearAll());
-
 		this.syncTool();
 	}
 
-	private onToolClick(id: ToolMode | "erase"): void {
-		if (id === "shape") {
-			if (this.tool.mode === "shape") {
-				this.shapeKind = this.shapeKind === "rect" ? "ellipse" : "rect";
-			}
-			this.setMode("shape");
-			return;
+	private onToolClick(
+		id: ToolMode | "erase" | "style" | "mic" | "undo" | "trash"
+	): void {
+		switch (id) {
+			case "style":
+				this.openStylePopover(this.styleBtnEl);
+				return;
+			case "shape":
+				this.openShapePopover(this.toolBtnEls["shape"] ?? this.toolbar);
+				return;
+			case "erase":
+				this.openErasePopover(this.toolBtnEls["erase"] ?? this.toolbar);
+				return;
+			case "mic":
+				this.toggleVoice();
+				return;
+			case "undo":
+				this.undo();
+				return;
+			case "trash":
+				this.clearAll();
+				return;
+			default:
+				this.setMode(id);
 		}
-		if (id === "erase") {
-			const active = this.isEraseMode();
-			if (active) {
-				this.eraseKind = this.eraseKind === "px" ? "stroke" : "px";
-			}
-			this.setMode(this.eraseKind === "px" ? "erasePx" : "eraseStroke");
-			return;
+	}
+
+	private closePopover(): void {
+		this.popover?.remove();
+		this.popover = null;
+		if (this.popCloser) {
+			window.removeEventListener("pointerdown", this.popCloser, true);
+			this.popCloser = null;
 		}
-		this.setMode(id);
+	}
+
+	private openPopover(
+		anchor: HTMLElement,
+		build: (el: HTMLElement) => void
+	): void {
+		this.closePopover();
+		const content = this.view.contentEl;
+		const pop = content.createDiv({ cls: "free-doodle-popover" });
+		this.popover = pop;
+		build(pop);
+		const aRect = anchor.getBoundingClientRect();
+		const cRect = content.getBoundingClientRect();
+		pop.style.left = `${Math.max(4, Math.round(aRect.left - cRect.left))}px`;
+		pop.style.top = `${Math.round(aRect.bottom - cRect.top + 6)}px`;
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover && !this.popover.contains(t) && !anchor.contains(t)) {
+				this.closePopover();
+			}
+		};
+		this.popCloser = closer;
+		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
+	}
+
+	private openStylePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			el.addClass("free-doodle-style-pop");
+			this.swatchEls = [];
+			this.widthPresetEls = [];
+			const colors = el.createDiv({ cls: "free-doodle-pop-row" });
+			for (const c of PALETTE) {
+				const b = colors.createEl("button", {
+					cls: "free-doodle-swatch",
+					attr: { title: c },
+				});
+				b.dataset.color = c;
+				b.addEventListener("click", () => {
+					this.tool.color = c;
+					if (this.isEraseMode()) this.setMode("pen");
+					else this.syncTool();
+				});
+				this.swatchEls.push(b);
+			}
+			this.colorInputEl = colors.createEl("input", {
+				cls: "free-doodle-color-input",
+				type: "color",
+				attr: { title: "自定义颜色" },
+			});
+			this.colorInputEl.value = this.tool.color;
+			this.colorInputEl.addEventListener("input", () => {
+				this.tool.color = this.colorInputEl.value;
+				if (this.isEraseMode()) this.setMode("pen");
+				else this.syncTool();
+			});
+
+			const sizeRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			sizeRow.createSpan({ cls: "free-doodle-pop-label", text: "粗细" });
+			for (const [label, val] of [
+				["细", 2],
+				["中", 5],
+				["粗", 10],
+			] as const) {
+				const b = sizeRow.createEl("button", {
+					cls: "free-doodle-btn free-doodle-wpreset",
+					text: label,
+				});
+				b.dataset.size = String(val);
+				b.addEventListener("click", () => {
+					this.tool.size = val;
+					this.syncTool();
+				});
+				this.widthPresetEls.push(b);
+			}
+
+			const opRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			opRow.createSpan({ cls: "free-doodle-pop-label", text: "不透明" });
+			this.opacitySliderEl = opRow.createEl("input", {
+				cls: "free-doodle-slider",
+				type: "range",
+				attr: { min: "10", max: "100", step: "5" },
+			});
+			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
+			this.opacityLabelEl = opRow.createSpan({
+				cls: "free-doodle-size-label",
+				text: `${Math.round(this.tool.opacity * 100)}%`,
+			});
+			this.opacitySliderEl.addEventListener("input", () => {
+				this.tool.opacity = Number(this.opacitySliderEl.value) / 100;
+				this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
+			});
+
+			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			smRow.createSpan({ cls: "free-doodle-pop-label", text: "优化" });
+			const smBtn = smRow.createEl("button", {
+				cls: "free-doodle-btn clickable-icon",
+				attr: { title: "笔迹平滑（去抖动）" },
+			});
+			setIcon(smBtn, "sparkles");
+			smBtn.toggleClass("is-active", this.smooth);
+			smBtn.addEventListener("click", () => {
+				this.smooth = !this.smooth;
+				smBtn.toggleClass("is-active", this.smooth);
+			});
+			this.syncTool();
+		});
+	}
+
+	private openShapePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			const defs = [
+				{ shape: "line" as DrawShape, icon: "minus", title: "直线" },
+				{ shape: "arrow" as DrawShape, icon: "arrow-up-right", title: "箭头" },
+				{ shape: "rect" as DrawShape, icon: "square", title: "矩形" },
+				{ shape: "ellipse" as DrawShape, icon: "circle", title: "椭圆" },
+				{ shape: "diamond" as DrawShape, icon: "diamond", title: "菱形" },
+			];
+			for (const d of defs) {
+				const b = el.createEl("button", {
+					cls: "free-doodle-btn clickable-icon free-doodle-pop-item",
+					attr: { title: d.title },
+				});
+				setIcon(b, d.icon);
+				b.toggleClass("is-active", this.tool.mode === "shape" && this.shapeKind === d.shape);
+				b.addEventListener("click", () => {
+					this.shapeKind = d.shape;
+					this.setMode("shape");
+					this.closePopover();
+				});
+			}
+		});
+	}
+
+	private openErasePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			const defs = [
+				{ kind: "px" as EraseKind, mode: "erasePx" as ToolMode, icon: "eraser", title: "像素擦除（擦掉划过的区域）" },
+				{ kind: "stroke" as EraseKind, mode: "eraseStroke" as ToolMode, icon: "scissors", title: "整笔擦除（删除碰到的整笔）" },
+			];
+			for (const d of defs) {
+				const b = el.createEl("button", {
+					cls: "free-doodle-btn clickable-icon free-doodle-pop-item",
+					attr: { title: d.title },
+				});
+				setIcon(b, d.icon);
+				b.toggleClass("is-active", this.eraseKind === d.kind);
+				b.addEventListener("click", () => {
+					this.eraseKind = d.kind;
+					this.setMode(d.mode);
+					this.closePopover();
+				});
+			}
+		});
 	}
 
 	private setMode(mode: ToolMode): void {
@@ -665,12 +953,15 @@ class InkOverlay {
 			el.toggleClass(
 				"is-active",
 				!eraseActive &&
-					el.style.backgroundColor.toLowerCase() === this.tool.color.toLowerCase()
+					(el.dataset.color ?? "").toLowerCase() === this.tool.color.toLowerCase()
 			)
+		);
+		this.widthPresetEls.forEach((el) =>
+			el.toggleClass("is-active", Number(el.dataset.size) === this.tool.size)
 		);
 		const shapeBtn = this.toolBtnEls["shape"];
 		if (shapeBtn) {
-			setIcon(shapeBtn, this.shapeKind === "rect" ? "square" : "circle");
+			setIcon(shapeBtn, "shapes");
 			shapeBtn.toggleClass("is-active", this.tool.mode === "shape");
 		}
 		const eraseBtn = this.toolBtnEls["erase"];
@@ -682,6 +973,8 @@ class InkOverlay {
 		if (penBtn) penBtn.toggleClass("is-active", this.tool.mode === "pen");
 		const hlBtn = this.toolBtnEls["hl"];
 		if (hlBtn) hlBtn.toggleClass("is-active", this.tool.mode === "hl");
+		const micBtn = this.toolBtnEls["mic"];
+		if (micBtn) micBtn.toggleClass("is-active", this.recognizing);
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
@@ -689,6 +982,47 @@ class InkOverlay {
 			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
 		if (this.opacityLabelEl)
 			this.opacityLabelEl.setText(`${Math.round(this.tool.opacity * 100)}%`);
+	}
+
+	private toggleVoice(): void {
+		if (this.recognizing) {
+			this.recog?.stop();
+			return;
+		}
+		const Ctor = GetSpeechRecognitionCtor();
+		if (!Ctor) {
+			new Notice("当前环境不支持语音识别");
+			return;
+		}
+		const r = new Ctor();
+		r.lang = "zh-CN";
+		r.continuous = true;
+		r.interimResults = false;
+		r.onresult = (ev: SpeechRecEvent) => {
+			let txt = "";
+			for (let i = ev.resultIndex; i < ev.results.length; i++) {
+				const item = ev.results[i];
+				if (item.isFinal && item[0]?.transcript) txt += item[0].transcript;
+			}
+			if (txt.trim()) this.view.editor.replaceSelection(txt + " ");
+		};
+		r.onerror = (ev: { error: string }) => {
+			Diag.log(`voice error: ${ev.error}`);
+		};
+		r.onend = () => {
+			this.recognizing = false;
+			this.syncTool();
+		};
+		try {
+			r.start();
+			this.recog = r;
+			this.recognizing = true;
+			this.syncTool();
+			new Notice("语音输入中…再次点击麦克风结束");
+		} catch (err) {
+			Diag.log(`voice start failed: ${String(err)}`);
+			new Notice("语音启动失败，详见控制台");
+		}
 	}
 
 	/* ---------- 绘制 ---------- */
@@ -737,28 +1071,7 @@ class InkOverlay {
 			const px = p.x - dx;
 			const py = p.y - dy;
 			let hit = false;
-			if ((s.shape === "rect" || s.shape === "ellipse") && s.points.length >= 2) {
-				const a = s.points[0];
-				const b = s.points[s.points.length - 1];
-				const x0 = Math.min(a.x, b.x);
-				const y0 = Math.min(a.y, b.y);
-				const x1 = Math.max(a.x, b.x);
-				const y1 = Math.max(a.y, b.y);
-				if (s.shape === "rect") {
-					const nearEdge =
-						(px >= x0 - th && px <= x1 + th && (Math.abs(py - y0) <= th || Math.abs(py - y1) <= th)) ||
-						(py >= y0 - th && py <= y1 + th && (Math.abs(px - x0) <= th || Math.abs(px - x1) <= th));
-					hit = nearEdge || (px > x0 && px < x1 && py > y0 && py < y1);
-				} else {
-					const cx = (x0 + x1) / 2;
-					const cy = (y0 + y1) / 2;
-					const rx = Math.max((x1 - x0) / 2, 1);
-					const ry = Math.max((y1 - y0) / 2, 1);
-					const nx = (px - cx) / (rx + th);
-					const ny = (py - cy) / (ry + th);
-					hit = nx * nx + ny * ny <= 1;
-				}
-			} else {
+			if (!s.shape) {
 				for (const q of s.points) {
 					const ddx = q.x - px;
 					const ddy = q.y - py;
@@ -767,6 +1080,8 @@ class InkOverlay {
 						break;
 					}
 				}
+			} else {
+				hit = hitShapeOrPath(s, px, py, th);
 			}
 			if (hit) {
 				if (this.strokeEraseUndoArmed) {
@@ -822,17 +1137,23 @@ class InkOverlay {
 		if (!s) return;
 		this.current = null;
 
-		// 矩形拖动距离过小则丢弃
-		if (s.shape === "rect" && s.points.length >= 2) {
+		// 形状拖动距离过小则丢弃
+		if (s.shape && s.points.length >= 2) {
 			const a = s.points[0];
 			const b = s.points[s.points.length - 1];
 			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
 		}
 
-		this.attachAnchor(s);
+		// 笔迹优化：自由笔迹做去抖 + 平滑拟合
+		let final: Stroke = s;
+		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
+			final = { ...s, points: beautifyPoints(s.points) };
+		}
+
+		this.attachAnchor(final);
 		this.undoStack.push(this.strokes.slice());
 		if (this.undoStack.length > 50) this.undoStack.shift();
-		this.strokes.push(s);
+		this.strokes.push(final);
 		this.redraw();
 		this.scheduleSave();
 	};
@@ -1193,6 +1514,39 @@ type ShapeKind = "rect" | "ellipse";
 
 type EraseKind = "px" | "stroke";
 
+type DrawShape = ShapeKind | "line" | "arrow" | "diamond";
+
+interface SpeechRecEvent {
+	resultIndex: number;
+	results: ArrayLike<{ isFinal: boolean; 0?: { transcript: string } }>;
+}
+
+interface SpeechRecLike {
+	lang: string;
+	continuous: boolean;
+	interimResults: boolean;
+	start(): void;
+	stop(): void;
+	onresult: ((ev: SpeechRecEvent) => void) | null;
+	onerror: ((ev: { error: string }) => void) | null;
+	onend: (() => void) | null;
+}
+
+function GetSpeechRecognitionCtor(): (new () => SpeechRecLike) | null {
+	const w = window as unknown as Record<string, unknown>;
+	if (typeof w.SpeechRecognition === "function") {
+		return w.SpeechRecognition as new () => SpeechRecLike;
+	}
+	if (typeof w.webkitSpeechRecognition === "function") {
+		return w.webkitSpeechRecognition as new () => SpeechRecLike;
+	}
+	return null;
+}
+
+function SpeechCapable(): boolean {
+	return GetSpeechRecognitionCtor() !== null;
+}
+
 class DoodleView extends ItemView {
 	private plugin: FreeDoodlePlugin;
 	private canvas!: HTMLCanvasElement;
@@ -1207,7 +1561,12 @@ class DoodleView extends ItemView {
 	private opacity = 1;
 	private mode: BoardTool = "pen";
 
-	private shapeKind: ShapeKind = "rect";
+	private smooth = true;
+	private popover: HTMLElement | null = null;
+	private popCloser: ((e: MouseEvent) => void) | null = null;
+	private widthPresetEls: HTMLElement[] = [];
+
+	private shapeKind: DrawShape = "rect";
 	private eraseKind: EraseKind = "px";
 	private previewScheduled = false;
 
@@ -1222,6 +1581,7 @@ class DoodleView extends ItemView {
 	private sizeLabelEl!: HTMLElement;
 	private opacitySliderEl!: HTMLInputElement;
 	private opacityLabelEl!: HTMLElement;
+	private styleBtnEl!: HTMLElement;
 	private toolBtnEls: Record<string, HTMLElement> = {};
 
 	private effSize(): number {
@@ -1286,63 +1646,25 @@ class DoodleView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.closePopover();
 		this.ro?.disconnect();
 		this.contentEl.empty();
 	}
 
 	private buildToolbar(toolbar: HTMLDivElement): void {
-		for (const c of PALETTE) {
+		const mkBtn = (
+			icon: string,
+			title: string,
+			onClick: () => void
+		): HTMLButtonElement => {
 			const b = toolbar.createEl("button", {
-				cls: "free-doodle-swatch",
-				attr: { title: c },
+				cls: "free-doodle-btn clickable-icon",
+				attr: { title },
 			});
-			b.style.backgroundColor = c;
-			b.addEventListener("click", () => {
-				this.color = c;
-				this.setBoardMode("pen");
-			});
-			this.swatchEls.push(b);
-		}
-
-		this.colorInputEl = toolbar.createEl("input", {
-			cls: "free-doodle-color-input",
-			type: "color",
-			attr: { title: "自定义颜色" },
-		});
-		this.colorInputEl.value = this.color;
-		this.colorInputEl.addEventListener("input", () => {
-			this.color = this.colorInputEl.value;
-			if (this.mode === "erasePx" || this.mode === "eraseStroke") this.setBoardMode("pen");
-			else this.syncToolbar();
-		});
-
-		const sizeWrap = toolbar.createDiv({ cls: "free-doodle-size-wrap" });
-		sizeWrap.createSpan({ text: "粗细" });
-		this.sizeSliderEl = sizeWrap.createEl("input", {
-			type: "range",
-			attr: { min: "1", max: "40", step: "1" },
-		});
-		this.sizeSliderEl.value = String(this.size);
-		this.sizeLabelEl = sizeWrap.createSpan({ cls: "free-doodle-size-label" });
-		this.sizeLabelEl.setText(`${this.effSize()} px`);
-		this.sizeSliderEl.addEventListener("input", () => {
-			this.size = Number(this.sizeSliderEl.value);
-			this.sizeLabelEl.setText(`${this.effSize()} px`);
-		});
-
-		const opWrap = toolbar.createDiv({ cls: "free-doodle-size-wrap" });
-		opWrap.createSpan({ text: "不透明" });
-		this.opacitySliderEl = opWrap.createEl("input", {
-			type: "range",
-			attr: { min: "10", max: "100", step: "5" },
-		});
-		this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
-		this.opacityLabelEl = opWrap.createSpan({ cls: "free-doodle-size-label" });
-		this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
-		this.opacitySliderEl.addEventListener("input", () => {
-			this.opacity = Number(this.opacitySliderEl.value) / 100;
-			this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
-		});
+			setIcon(b, icon);
+			b.addEventListener("click", onClick);
+			return b;
+		};
 
 		const tools = [
 			{ id: "pen" as const, icon: "pencil", title: "钢笔" },
@@ -1360,19 +1682,18 @@ class DoodleView extends ItemView {
 			this.toolBtnEls[t.id] = b;
 		}
 
-		const undoBtn = toolbar.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "撤销 (Ctrl+Z)" },
-		});
-		setIcon(undoBtn, "undo-2");
-		undoBtn.addEventListener("click", () => this.undo());
+		toolbar.createDiv({ cls: "free-doodle-sep" });
 
-		const clearBtn = toolbar.createEl("button", {
-			cls: "free-doodle-btn clickable-icon",
-			attr: { title: "清空画布" },
-		});
-		setIcon(clearBtn, "trash-2");
-		clearBtn.addEventListener("click", () => this.clear());
+		this.styleBtnEl = mkBtn("settings-2", "样式：颜色 / 粗细 / 不透明度 / 笔迹优化", () =>
+			this.openBoardStylePopover(this.styleBtnEl)
+		);
+
+		toolbar.createDiv({ cls: "free-doodle-sep" });
+
+		this.toolBtnEls["undo"] = mkBtn("undo-2", "撤销 (Ctrl+Z)", () => this.undo());
+		this.toolBtnEls["trash"] = mkBtn("trash-2", "清空画布", () => this.clear());
+
+		toolbar.createDiv({ cls: "free-doodle-sep" });
 
 		const saveBtn = toolbar.createEl("button", {
 			cls: "free-doodle-btn free-doodle-save mod-cta",
@@ -1387,18 +1708,11 @@ class DoodleView extends ItemView {
 
 	private onBoardToolClick(id: BoardTool | "erase"): void {
 		if (id === "shape") {
-			if (this.mode === "shape") {
-				this.shapeKind = this.shapeKind === "rect" ? "ellipse" : "rect";
-			}
-			this.setBoardMode("shape");
+			this.openBoardShapePopover(this.toolBtnEls["shape"] ?? this.styleBtnEl);
 			return;
 		}
 		if (id === "erase") {
-			const active = this.mode === "erasePx" || this.mode === "eraseStroke";
-			if (active) {
-				this.eraseKind = this.eraseKind === "px" ? "stroke" : "px";
-			}
-			this.setBoardMode(this.eraseKind === "px" ? "erasePx" : "eraseStroke");
+			this.openBoardErasePopover(this.toolBtnEls["erase"] ?? this.styleBtnEl);
 			return;
 		}
 		this.setBoardMode(id);
@@ -1409,7 +1723,7 @@ class DoodleView extends ItemView {
 		this.swatchEls.forEach((el) =>
 			el.toggleClass(
 				"is-active",
-				!eraseActive && el.style.backgroundColor.toLowerCase() === this.color.toLowerCase()
+				!eraseActive && (el.dataset.color ?? "").toLowerCase() === this.color.toLowerCase()
 			)
 		);
 		const shapeBtn = this.toolBtnEls["shape"];
@@ -1426,9 +1740,186 @@ class DoodleView extends ItemView {
 		if (penBtn) penBtn.toggleClass("is-active", this.mode === "pen");
 		const hlBtn = this.toolBtnEls["hl"];
 		if (hlBtn) hlBtn.toggleClass("is-active", this.mode === "hl");
+		this.widthPresetEls.forEach((el) =>
+			el.toggleClass("is-active", Number(el.dataset.size) === this.size)
+		);
 		if (this.colorInputEl) this.colorInputEl.value = this.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
+	}
+
+	private closePopover(): void {
+		this.popover?.remove();
+		this.popover = null;
+		if (this.popCloser) {
+			window.removeEventListener("pointerdown", this.popCloser, true);
+			this.popCloser = null;
+		}
+	}
+
+	private openPopover(
+		anchor: HTMLElement,
+		build: (el: HTMLElement) => void
+	): void {
+		this.closePopover();
+		const content = this.contentEl;
+		const pop = content.createDiv({ cls: "free-doodle-popover" });
+		this.popover = pop;
+		build(pop);
+		const aRect = anchor.getBoundingClientRect();
+		const cRect = content.getBoundingClientRect();
+		pop.style.left = `${Math.max(4, Math.round(aRect.left - cRect.left))}px`;
+		pop.style.top = `${Math.round(aRect.bottom - cRect.top + 6)}px`;
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover && !this.popover.contains(t) && !anchor.contains(t)) {
+				this.closePopover();
+			}
+		};
+		this.popCloser = closer;
+		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
+	}
+
+	private openBoardStylePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			el.addClass("free-doodle-style-pop");
+			this.swatchEls = [];
+			this.widthPresetEls = [];
+			const colors = el.createDiv({ cls: "free-doodle-pop-row" });
+			for (const c of PALETTE) {
+				const b = colors.createEl("button", {
+					cls: "free-doodle-swatch",
+					attr: { title: c },
+				});
+				b.dataset.color = c;
+				b.addEventListener("click", () => {
+					this.color = c;
+					if (this.mode === "erasePx" || this.mode === "eraseStroke")
+						this.setBoardMode("pen");
+					else this.syncToolbar();
+				});
+				this.swatchEls.push(b);
+			}
+			this.colorInputEl = colors.createEl("input", {
+				cls: "free-doodle-color-input",
+				type: "color",
+				attr: { title: "自定义颜色" },
+			});
+			this.colorInputEl.value = this.color;
+			this.colorInputEl.addEventListener("input", () => {
+				this.color = this.colorInputEl.value;
+				if (this.mode === "erasePx" || this.mode === "eraseStroke")
+					this.setBoardMode("pen");
+				else this.syncToolbar();
+			});
+
+			const sizeRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			sizeRow.createSpan({ cls: "free-doodle-pop-label", text: "粗细" });
+			for (const [label, val] of [
+				["细", 2],
+				["中", 5],
+				["粗", 10],
+			] as const) {
+				const b = sizeRow.createEl("button", {
+					cls: "free-doodle-btn free-doodle-wpreset",
+					text: label,
+				});
+				b.dataset.size = String(val);
+				b.addEventListener("click", () => {
+					this.size = val;
+					this.syncToolbar();
+				});
+				this.widthPresetEls.push(b);
+			}
+
+			const opRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			opRow.createSpan({ cls: "free-doodle-pop-label", text: "不透明" });
+			this.opacitySliderEl = opRow.createEl("input", {
+				cls: "free-doodle-slider",
+				type: "range",
+				attr: { min: "10", max: "100", step: "5" },
+			});
+			this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
+			this.opacityLabelEl = opRow.createSpan({
+				cls: "free-doodle-size-label",
+				text: `${Math.round(this.opacity * 100)}%`,
+			});
+			this.opacitySliderEl.addEventListener("input", () => {
+				this.opacity = Number(this.opacitySliderEl.value) / 100;
+				this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
+			});
+
+			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			smRow.createSpan({ cls: "free-doodle-pop-label", text: "优化" });
+			const smBtn = smRow.createEl("button", {
+				cls: "free-doodle-btn clickable-icon",
+				attr: { title: "笔迹平滑（去抖动）" },
+			});
+			setIcon(smBtn, "sparkles");
+			smBtn.toggleClass("is-active", this.smooth);
+			smBtn.addEventListener("click", () => {
+				this.smooth = !this.smooth;
+				smBtn.toggleClass("is-active", this.smooth);
+			});
+			this.syncToolbar();
+		});
+	}
+
+	private openBoardShapePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			const defs = [
+				{ shape: "line" as DrawShape, icon: "minus", title: "直线" },
+				{ shape: "arrow" as DrawShape, icon: "arrow-up-right", title: "箭头" },
+				{ shape: "rect" as DrawShape, icon: "square", title: "矩形" },
+				{ shape: "ellipse" as DrawShape, icon: "circle", title: "椭圆" },
+				{ shape: "diamond" as DrawShape, icon: "diamond", title: "菱形" },
+			];
+			for (const d of defs) {
+				const b = el.createEl("button", {
+					cls: "free-doodle-btn clickable-icon free-doodle-pop-item",
+					attr: { title: d.title },
+				});
+				setIcon(b, d.icon);
+				b.toggleClass("is-active", this.mode === "shape" && this.shapeKind === d.shape);
+				b.addEventListener("click", () => {
+					this.shapeKind = d.shape;
+					this.setBoardMode("shape");
+					this.closePopover();
+				});
+			}
+		});
+	}
+
+	private openBoardErasePopover(anchor: HTMLElement): void {
+		this.openPopover(anchor, (el) => {
+			const defs = [
+				{
+					kind: "px" as EraseKind,
+					mode: "erasePx" as BoardTool,
+					icon: "eraser",
+					title: "像素擦除（擦掉划过的区域）",
+				},
+				{
+					kind: "stroke" as EraseKind,
+					mode: "eraseStroke" as BoardTool,
+					icon: "scissors",
+					title: "整笔擦除（删除碰到的整笔）",
+				},
+			];
+			for (const d of defs) {
+				const b = el.createEl("button", {
+					cls: "free-doodle-btn clickable-icon free-doodle-pop-item",
+					attr: { title: d.title },
+				});
+				setIcon(b, d.icon);
+				b.toggleClass("is-active", this.eraseKind === d.kind);
+				b.addEventListener("click", () => {
+					this.eraseKind = d.kind;
+					this.setBoardMode(d.mode);
+					this.closePopover();
+				});
+			}
+		});
 	}
 
 	private setBoardMode(mode: BoardTool): void {
@@ -1511,32 +2002,7 @@ class DoodleView extends ItemView {
 			if (s.erase) continue;
 			const th = Math.max(10, s.size) + 6;
 			let hit = false;
-			if ((s.shape === "rect" || s.shape === "ellipse") && s.points.length >= 2) {
-				const a = s.points[0];
-				const b = s.points[s.points.length - 1];
-				const x0 = Math.min(a.x, b.x);
-				const y0 = Math.min(a.y, b.y);
-				const x1 = Math.max(a.x, b.x);
-				const y1 = Math.max(a.y, b.y);
-				if (s.shape === "rect") {
-					const nearEdge =
-						(p.x >= x0 - th &&
-							p.x <= x1 + th &&
-							(Math.abs(p.y - y0) <= th || Math.abs(p.y - y1) <= th)) ||
-						(p.y >= y0 - th &&
-							p.y <= y1 + th &&
-							(Math.abs(p.x - x0) <= th || Math.abs(p.x - x1) <= th));
-					hit = nearEdge || (p.x > x0 && p.x < x1 && p.y > y0 && p.y < y1);
-				} else {
-					const cx = (x0 + x1) / 2;
-					const cy = (y0 + y1) / 2;
-					const rx = Math.max((x1 - x0) / 2, 1);
-					const ry = Math.max((y1 - y0) / 2, 1);
-					const nx = (p.x - cx) / (rx + th);
-					const ny = (p.y - cy) / (ry + th);
-					hit = nx * nx + ny * ny <= 1;
-				}
-			} else {
+			if (!s.shape) {
 				for (const q of s.points) {
 					const ddx = q.x - p.x;
 					const ddy = q.y - p.y;
@@ -1545,6 +2011,8 @@ class DoodleView extends ItemView {
 						break;
 					}
 				}
+			} else {
+				hit = hitShapeOrPath(s, p.x, p.y, th);
 			}
 			if (hit) {
 				if (this.strokeEraseUndoArmed) {
@@ -1601,8 +2069,13 @@ class DoodleView extends ItemView {
 			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
 		}
 
+		let final: Stroke = s;
+		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
+			final = { ...s, points: beautifyPoints(s.points) };
+		}
+
 		this.pushUndo();
-		this.strokes.push(s);
+		this.strokes.push(final);
 		this.redraw();
 	}
 
