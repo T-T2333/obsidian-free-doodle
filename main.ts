@@ -450,12 +450,12 @@ function rdpSimplify(pts: Point[], eps: number): Point[] {
  * 笔迹美化：RDP 去抖（自适应阈值）→ 两轮 Chaikin 平滑。
  * 与渲染层的中点平滑不同，这里先移除抖动再拟合，字迹明显更干净。
  */
-function beautifyPoints(pts: Point[], stability = 50): Point[] {
+function beautifyPoints(pts: Point[], stability = 50, rounds = 2): Point[] {
 	if (pts.length < 3) return pts;
 	const eps = Math.min(3, Math.max(1.2, pts.length * 0.008)) * (0.6 + stability / 100);
 	const simplified = rdpSimplify(pts, eps);
 	let cur = chaikinOnce(simplified);
-	if (stability >= 40) cur = chaikinOnce(cur);
+	for (let i = 1; i < rounds && stability >= 40; i++) cur = chaikinOnce(cur);
 	return cur;
 }
 
@@ -917,7 +917,8 @@ class InkOverlay {
 		canvas.style.width = `${w}px`;
 		canvas.style.height = `${h}px`;
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-		this.redraw();
+		this.rebuildBase();
+		this.paint();
 	}
 
 	/* ---------- 工具栏 ---------- */
@@ -1498,11 +1499,18 @@ class InkOverlay {
 			const ctx = this.ctx;
 			if (!s || !ctx || this.destroyed) return;
 			let draw = s;
-			// 拖动中实时预览美化结果（自由笔迹 + 开启优化时）
-			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
-				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
+			// 拖动中实时预览美化（限长防卡顿；提交时始终全量美化）
+			if (
+				!s.erase &&
+				!s.shape &&
+				this.smooth &&
+				s.points.length > 6 &&
+				s.points.length < 1200
+			) {
+				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability, 1) };
 			}
-			this.redraw();
+			// 每帧仅贴图 + 当前笔迹，已提交墨迹在离屏缓存中
+			this.paint();
 			drawStroke(ctx, draw);
 		});
 	}
@@ -1594,16 +1602,48 @@ class InkOverlay {
 		new Notice("已清除该笔记的涂鸦数据");
 	}
 
-	private redraw(): void {
-		const ctx = this.ctx;
-		if (!ctx) return;
-		ctx.clearRect(0, 0, this.cw, this.ch);
-		if (!this.strokes.length) return;
+	private baseCanvas: HTMLCanvasElement | null = null;
+	private baseCtx: CanvasRenderingContext2D | null = null;
+
+	/** 已提交墨迹渲染到离屏缓存；绘制中每帧仅贴图 + 当前笔迹，避免整幅重绘卡顿 */
+	private rebuildBase(): void {
+		if (this.destroyed || !this.canvas) return;
+		if (!this.baseCanvas || !this.baseCtx) {
+			this.baseCanvas = document.createElement("canvas");
+			this.baseCtx = this.baseCanvas.getContext("2d");
+		}
+		const bc = this.baseCanvas;
+		const bctx = this.baseCtx!;
+		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const tw = Math.floor(this.cw * dpr);
+		const th = Math.floor(this.ch * dpr);
+		if (bc.width !== tw || bc.height !== th) {
+			bc.width = tw;
+			bc.height = th;
+		}
+		bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		bctx.clearRect(0, 0, this.cw, this.ch);
 		const entries = this.getCandidateEntries();
 		for (const s of this.strokes) {
 			const { dx, dy } = this.findBlockDeltaIn(entries, s);
-			drawStroke(ctx, s, dx, dy);
+			drawStroke(bctx, s, dx, dy);
 		}
+	}
+
+	private paint(): void {
+		const ctx = this.ctx;
+		const cv = this.canvas;
+		if (!ctx || !cv || !this.baseCanvas) return;
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, cv.width, cv.height);
+		ctx.restore();
+		ctx.drawImage(this.baseCanvas, 0, 0, this.cw, this.ch);
+	}
+
+	private redraw(): void {
+		this.rebuildBase();
+		this.paint();
 	}
 
 	private static readonly BLOCK_SEL = ".cm-line, p, li, h1, h2, h3, h4, h5, h6";
@@ -2396,7 +2436,8 @@ class DoodleView extends ItemView {
 		this.canvas.width = Math.floor(this.cw * dpr);
 		this.canvas.height = Math.floor(this.ch * dpr);
 		this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-		this.redraw();
+		this.rebuildBase();
+		this.paint();
 	}
 
 	private pushUndo(): void {
@@ -2540,10 +2581,16 @@ class DoodleView extends ItemView {
 			const s = this.current;
 			if (!s || !this.ctx || !this.containerEl.isConnected) return;
 			let draw = s;
-			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
-				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
+			if (
+				!s.erase &&
+				!s.shape &&
+				this.smooth &&
+				s.points.length > 6 &&
+				s.points.length < 1200
+			) {
+				draw = { ...s, points: beautifyPoints(s.points, this.curCfg().stability, 1) };
 			}
-			this.redraw();
+			this.paint();
 			drawStroke(this.ctx, draw);
 		});
 	}
@@ -2599,11 +2646,43 @@ class DoodleView extends ItemView {
 		this.redraw();
 	}
 
+	private baseCanvas: HTMLCanvasElement | null = null;
+	private baseCtx: CanvasRenderingContext2D | null = null;
+
+	private rebuildBase(): void {
+		if (!this.baseCanvas || !this.baseCtx) {
+			this.baseCanvas = document.createElement("canvas");
+			this.baseCtx = this.baseCanvas.getContext("2d");
+		}
+		const bc = this.baseCanvas;
+		const bctx = this.baseCtx!;
+		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const tw = Math.floor(this.cw * dpr);
+		const th = Math.floor(this.ch * dpr);
+		if (bc.width !== tw || bc.height !== th) {
+			bc.width = tw;
+			bc.height = th;
+		}
+		bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		bctx.fillStyle = "#ffffff";
+		bctx.fillRect(0, 0, this.cw, this.ch);
+		drawStrokes(bctx, this.strokes);
+	}
+
+	private paint(): void {
+		const ctx = this.ctx;
+		const cv = this.canvas;
+		if (!ctx || !cv || !this.baseCanvas) return;
+		ctx.save();
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, cv.width, cv.height);
+		ctx.restore();
+		ctx.drawImage(this.baseCanvas, 0, 0, this.cw, this.ch);
+	}
+
 	private redraw(): void {
-		this.ctx.clearRect(0, 0, this.cw, this.ch);
-		this.ctx.fillStyle = "#ffffff";
-		this.ctx.fillRect(0, 0, this.cw, this.ch);
-		drawStrokes(this.ctx, this.strokes);
+		this.rebuildBase();
+		this.paint();
 	}
 
 	private async saveToVault(): Promise<void> {
