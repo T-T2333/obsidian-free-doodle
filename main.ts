@@ -1123,7 +1123,7 @@ class InkOverlay {
 		const ctx = this.ctx;
 		if (this.laserPts.length > 1) {
 			ctx.save();
-			ctx.lineCap = "round";
+			ctx.lineCap = "butt";
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.tool.color;
 			for (let i = 1; i < this.laserPts.length; i++) {
@@ -1385,6 +1385,12 @@ class InkOverlay {
 		if (hlBtn) hlBtn.toggleClass("is-active", this.tool.mode === "hl");
 		const micBtn = this.toolBtnEls["mic"];
 		if (micBtn) micBtn.toggleClass("is-active", this.recognizing);
+		for (const id of ["pencil", "ball", "marker", "laser"] as const) {
+			const b = this.toolBtnEls[id];
+			if (b) b.toggleClass("is-active", this.tool.mode === id);
+		}
+		const textBtn = this.toolBtnEls["text"];
+		if (textBtn) textBtn.toggleClass("is-active", this.tool.mode === "text");
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
@@ -1798,6 +1804,23 @@ class InkOverlay {
 	private redraw(): void {
 		this.rebuildBase();
 		this.paint();
+		// 外部触发的重绘（DOM 变化/尺寸变化）也要保留进行中的笔迹
+		const s = this.current;
+		if (
+			s &&
+			!s.erase &&
+			!s.shape &&
+			s.points.length === this.inkCount &&
+			this.inkCanvas
+		) {
+			const ctx = this.ctx;
+			if (ctx) {
+				ctx.save();
+				ctx.globalAlpha = s.alpha ?? 1;
+				ctx.drawImage(this.inkCanvas, 0, 0, this.cw, this.ch);
+				ctx.restore();
+			}
+		}
 	}
 
 	private static readonly BLOCK_SEL = ".cm-line, p, li, h1, h2, h3, h4, h5, h6";
@@ -2406,7 +2429,7 @@ class DoodleView extends ItemView {
 			const cfg = this.plugin.settings.brushes.laser;
 			const ctx = this.ctx;
 			ctx.save();
-			ctx.lineCap = "round";
+			ctx.lineCap = "butt";
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.color;
 			for (let i = 1; i < this.laserPts.length; i++) {
@@ -3026,6 +3049,10 @@ class DoodleView extends ItemView {
 	private redraw(): void {
 		this.rebuildBase();
 		this.paint();
+		const s = this.current;
+		if (s) {
+			drawStroke(this.ctx, s);
+		}
 	}
 
 	private async saveToVault(): Promise<void> {
