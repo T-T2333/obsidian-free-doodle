@@ -1925,6 +1925,16 @@ class InkOverlay {
 				return;
 			}
 			if (e.key !== "Escape") return;
+			// Esc 优先关闭弹层（样式/形状/橡皮/文本输入），再退出涂鸦模式
+			if (this.popover) {
+				const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+				if (activeView === this.view) {
+					e.preventDefault();
+					e.stopPropagation();
+					this.closePopover();
+				}
+				return;
+			}
 			const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
 			if (activeView === this.view) {
 				e.preventDefault();
@@ -2814,6 +2824,7 @@ class DoodleView extends ItemView {
 			this.pushUndo();
 			this.strokes.push(st);
 			this.redraw();
+			this.syncToolbar();
 		};
 		input.addEventListener("keydown", (e) => {
 			if (e.key === "Enter") commit();
