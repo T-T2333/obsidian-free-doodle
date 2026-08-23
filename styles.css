@@ -201,12 +201,32 @@
 }
 
 .free-doodle-color-input {
-	width: 32px;
+	appearance: none;
+	-webkit-appearance: none;
+	width: 24px;
 	height: 24px;
 	padding: 0;
-	border: none;
-	background: none;
+	border: 2px dashed var(--text-faint);
+	border-radius: 50%;
+	background: conic-gradient(
+		#ff5959,
+		#ffb44d,
+		#ffe14d,
+		#6ee75c,
+		#4dc3ff,
+		#a06bff,
+		#ff5959
+	);
 	cursor: pointer;
+}
+
+.free-doodle-color-input::-webkit-color-swatch-wrapper {
+	padding: 2px;
+}
+
+.free-doodle-color-input::-webkit-color-swatch {
+	border: 2px solid var(--background-primary);
+	border-radius: 50%;
 }
 
 .free-doodle-size-wrap {

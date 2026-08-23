@@ -452,7 +452,7 @@ function rdpSimplify(pts: Point[], eps: number): Point[] {
  */
 function beautifyPoints(pts: Point[], stability = 50, rounds = 2): Point[] {
 	if (pts.length < 3) return pts;
-	const eps = Math.min(3, Math.max(1.2, pts.length * 0.008)) * (0.6 + stability / 100);
+	const eps = 1.4 + (stability / 100) * 2.0;
 	const simplified = rdpSimplify(pts, eps);
 	let cur = chaikinOnce(simplified);
 	for (let i = 1; i < rounds && stability >= 40; i++) cur = chaikinOnce(cur);
@@ -947,7 +947,7 @@ class InkOverlay {
 			{ id: "ball" as const, icon: "pen", title: "圆珠笔" },
 			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
 			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
-			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
+			{ id: "laser" as const, icon: "flashlight", title: "激光笔（发光）" },
 		];
 		for (const t of tools) {
 			const b = mkBtn(t.icon, t.title, () => this.onToolClick(t.id));
@@ -992,6 +992,7 @@ class InkOverlay {
 		}
 
 		this.toolBtnEls["undo"] = mkBtn("undo-2", "撤销 (Ctrl+Z)", () => this.undo());
+		this.toolBtnEls["redo"] = mkBtn("redo-2", "重做 (Ctrl+Shift+Z)", () => this.redo());
 		this.toolBtnEls["trash"] = mkBtn("trash-2", "清空全部墨迹", () => this.clearAll());
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -1019,6 +1020,7 @@ class InkOverlay {
 			return;
 		}
 		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 		this.strokes[this.strokes.length - 1] = fitted;
 		this.redraw();
 		this.scheduleSave();
@@ -1451,6 +1453,7 @@ class InkOverlay {
 			};
 			this.attachAnchor(st);
 			this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 			this.strokes.push(st);
 			this.redraw();
 			this.scheduleSave();
@@ -1496,6 +1499,7 @@ class InkOverlay {
 			if (hit) {
 				if (this.strokeEraseUndoArmed) {
 					this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 					if (this.undoStack.length > 50) this.undoStack.shift();
 					this.strokeEraseUndoArmed = false;
 				}
@@ -1584,6 +1588,7 @@ class InkOverlay {
 
 		this.attachAnchor(final);
 		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 		if (this.undoStack.length > 50) this.undoStack.shift();
 		this.strokes.push(final);
 		this.redraw();
@@ -1594,10 +1599,23 @@ class InkOverlay {
 		this.current = null;
 	};
 
+	private redoStack: Stroke[][] = [];
+
 	private undo(): void {
 		const prev = this.undoStack.pop();
 		if (!prev) return;
+		this.redoStack.push(this.strokes.slice());
 		this.strokes = prev;
+		this.redraw();
+		this.scheduleSave();
+	}
+
+	private redo(): void {
+		const next = this.redoStack.pop();
+		if (!next) return;
+		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
+		this.strokes = next;
 		this.redraw();
 		this.scheduleSave();
 	}
@@ -1605,6 +1623,7 @@ class InkOverlay {
 	private clearAll(): void {
 		if (!this.strokes.length) return;
 		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 		this.strokes = [];
 		this.redraw();
 		this.flushSave();
@@ -1778,9 +1797,18 @@ class InkOverlay {
 	private addEscListener(): void {
 		if (this.escHandler) return;
 		this.escHandler = (e: KeyboardEvent) => {
+			const mod = e.ctrlKey || e.metaKey;
+			if (mod && e.key.toLowerCase() === "z") {
+				const active = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+				if (active !== this.view) return;
+				e.preventDefault();
+				if (e.shiftKey || e.key.toLowerCase() === "y") this.redo();
+				else this.undo();
+				return;
+			}
 			if (e.key !== "Escape") return;
-			const active = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
-			if (active === this.view) {
+			const activeView = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+			if (activeView === this.view) {
 				e.preventDefault();
 				e.stopPropagation();
 				this.plugin.exitAnnotate();
@@ -2147,9 +2175,16 @@ class DoodleView extends ItemView {
 			evt.preventDefault()
 		);
 		this.registerDomEvent(root, "keydown", (evt: KeyboardEvent) => {
-			if ((evt.ctrlKey || evt.metaKey) && !evt.shiftKey && evt.key.toLowerCase() === "z") {
+			const mod = evt.ctrlKey || evt.metaKey;
+			if (mod && !evt.shiftKey && evt.key.toLowerCase() === "z") {
 				evt.preventDefault();
 				this.undo();
+			} else if (
+				(mod && evt.shiftKey && evt.key.toLowerCase() === "z") ||
+				(mod && evt.key.toLowerCase() === "y")
+			) {
+				evt.preventDefault();
+				this.redo();
 			}
 		});
 	}
@@ -2181,7 +2216,7 @@ class DoodleView extends ItemView {
 			{ id: "ball" as const, icon: "pen", title: "圆珠笔" },
 			{ id: "marker" as const, icon: "paintbrush", title: "马克笔（宽头）" },
 			{ id: "hl" as const, icon: "highlighter", title: "荧光笔" },
-			{ id: "laser" as const, icon: "zap", title: "激光笔（发光）" },
+			{ id: "laser" as const, icon: "flashlight", title: "激光笔（发光）" },
 			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
 			{ id: "text" as const, icon: "type", title: "文本标注：点击画布插入文字" },
 			{ id: "erase" as const, icon: "eraser", title: "橡皮：像素 / 整笔擦除" },
@@ -2201,6 +2236,7 @@ class DoodleView extends ItemView {
 		toolbar.createDiv({ cls: "free-doodle-sep" });
 
 		this.toolBtnEls["undo"] = mkBtn("undo-2", "撤销 (Ctrl+Z)", () => this.undo());
+		this.toolBtnEls["redo"] = mkBtn("redo-2", "重做 (Ctrl+Shift+Z)", () => this.redo());
 		this.toolBtnEls["trash"] = mkBtn("trash-2", "清空画布", () => this.clear());
 
 		toolbar.createDiv({ cls: "free-doodle-sep" });
@@ -2475,13 +2511,26 @@ class DoodleView extends ItemView {
 
 	private pushUndo(): void {
 		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
 		if (this.undoStack.length > 50) this.undoStack.shift();
 	}
+
+	private redoStack: Stroke[][] = [];
 
 	private undo(): void {
 		const prev = this.undoStack.pop();
 		if (!prev) return;
+		this.redoStack.push(this.strokes.slice());
 		this.strokes = prev;
+		this.redraw();
+	}
+
+	private redo(): void {
+		const next = this.redoStack.pop();
+		if (!next) return;
+		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
+		this.strokes = next;
 		this.redraw();
 	}
 
