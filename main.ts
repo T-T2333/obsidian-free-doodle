@@ -627,6 +627,7 @@ class InkOverlay {
 		if (this.wrap && this.canvas && this.ctx) {
 			// 迁移已有画布节点：像素保留，避免重挂载时墨迹短暂消失
 			scroller.appendChild(this.wrap);
+			this.wrap.toggleClass("is-interactive", this.interactive);
 			this.scroller = scroller;
 		} else {
 			this.unmount();
