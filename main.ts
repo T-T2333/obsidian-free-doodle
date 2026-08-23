@@ -783,22 +783,31 @@ class InkOverlay {
 	private mo?: MutationObserver;
 	private ro?: ResizeObserver;
 
+	private framePending = false;
+
+	/** rAF 合帧的重绘请求：ResizeObserver / DOM 变化等高频事件统一走这里 */
+	private requestRepaint(): void {
+		if (this.framePending || this.destroyed) return;
+		this.framePending = true;
+		window.requestAnimationFrame(() => {
+			this.framePending = false;
+			if (this.destroyed) return;
+			if (!this.canvas || !this.canvas.isConnected) {
+				this.mount();
+				return;
+			}
+			this.applySize();
+			this.redraw();
+		});
+	}
+
 	private watchDom(): void {
 		this.mo?.disconnect();
 		this.mo = new MutationObserver(() => {
 			if (this.destroyed) return;
 			// 笔记内容变化后文字块缓存即失效，避免锚定到已分离的旧元素
 			this.candCache = null;
-			if (!this.canvas || !this.canvas.isConnected) {
-				window.requestAnimationFrame(() => {
-					if (!this.destroyed && (!this.canvas || !this.canvas.isConnected)) {
-						this.mount();
-					}
-				});
-			} else {
-				this.applySize();
-				this.redraw();
-			}
+			this.requestRepaint();
 		});
 		this.mo.observe(this.view.contentEl, { childList: true, subtree: true });
 	}
@@ -854,9 +863,9 @@ class InkOverlay {
 
 		// 容器尺寸变化（如拖动侧边栏）时立即重绘，保证墨迹丝滑跟随
 		if (!this.ro) {
-			this.ro = new ResizeObserver(() => {
-				if (!this.destroyed) this.applySize();
-			});
+		this.ro = new ResizeObserver(() => {
+			if (!this.destroyed) this.requestRepaint();
+		});
 		}
 		this.ro.disconnect();
 		this.ro.observe(scroller);
@@ -1110,9 +1119,9 @@ class InkOverlay {
 		const fade = 900;
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
+		const cfg = this.plugin.settings.brushes.laser;
+		const ctx = this.ctx;
 		if (this.laserPts.length > 1) {
-			const cfg = this.plugin.settings.brushes.laser;
-			const ctx = this.ctx;
 			ctx.save();
 			ctx.lineCap = "round";
 			ctx.lineJoin = "round";
@@ -1133,6 +1142,18 @@ class InkOverlay {
 			ctx.restore();
 		}
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
+		const tip = this.laserPts[this.laserPts.length - 1];
+		if (tip) {
+			ctx.save();
+			ctx.globalAlpha = Math.max(0.3, 1 - (now - tip.t) / fade);
+			ctx.fillStyle = "#ffffff";
+			ctx.shadowColor = this.tool.color;
+			ctx.shadowBlur = cfg.size * 1.8;
+			ctx.beginPath();
+			ctx.arc(tip.x, tip.y, Math.max(2.5, cfg.size * 0.45), 0, Math.PI * 2);
+			ctx.fill();
+			ctx.restore();
+		}
 		if (this.laserPts.length > 0 || this.tool.mode === "laser") {
 			window.requestAnimationFrame(() => this.laserLoop());
 		} else {
@@ -1328,6 +1349,7 @@ class InkOverlay {
 			}
 		}
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
+		if (this.wrap) this.wrap.dataset.cursor = mode === "text" ? "text" : "draw";
 		this.syncTool();
 	}
 
@@ -2236,7 +2258,7 @@ class DoodleView extends ItemView {
 		setFontFamilyFromCanvas(this.canvas);
 		this.resizeCanvas();
 
-		this.ro = new ResizeObserver(() => this.resizeCanvas());
+		this.ro = new ResizeObserver(() => this.scheduleResize());
 		this.ro.observe(wrap);
 
 		this.registerDomEvent(this.canvas, "pointerdown", (evt: PointerEvent) =>
@@ -2375,6 +2397,20 @@ class DoodleView extends ItemView {
 			ctx.restore();
 		}
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
+		const tip = this.laserPts[this.laserPts.length - 1];
+		if (tip) {
+			const ctx = this.ctx;
+			const cfgL = this.plugin.settings.brushes.laser;
+			ctx.save();
+			ctx.globalAlpha = Math.max(0.3, 1 - (now - tip.t) / fade);
+			ctx.fillStyle = "#ffffff";
+			ctx.shadowColor = this.color;
+			ctx.shadowBlur = cfgL.size * 1.8;
+			ctx.beginPath();
+			ctx.arc(tip.x, tip.y, Math.max(2.5, cfgL.size * 0.45), 0, Math.PI * 2);
+			ctx.fill();
+			ctx.restore();
+		}
 		if (this.laserPts.length > 0 || this.mode === "laser") {
 			window.requestAnimationFrame(() => this.laserLoop());
 		} else {
@@ -2623,7 +2659,21 @@ class DoodleView extends ItemView {
 			if (this.opacityLabelEl) this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
 		}
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
+		this.canvas.setCssStyles({
+			cursor: mode === "text" ? "text" : "crosshair",
+		});
 		this.syncToolbar();
+	}
+
+	private resizePending = false;
+
+	private scheduleResize(): void {
+		if (this.resizePending) return;
+		this.resizePending = true;
+		window.requestAnimationFrame(() => {
+			this.resizePending = false;
+			this.resizeCanvas();
+		});
 	}
 
 	private resizeCanvas(): void {
