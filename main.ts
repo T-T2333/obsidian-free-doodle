@@ -297,17 +297,40 @@ function chaikinOnce(pts: Point[]): Point[] {
 	return out;
 }
 
-/** 折线美化：合并抖动点 → 两轮 Chaikin 平滑，保留端点 */
+/** RDP 抽稀：去掉手抖产生的高频抖动点 */
+function rdpSimplify(pts: Point[], eps: number): Point[] {
+	if (pts.length < 3) return pts;
+	const keep = new Uint8Array(pts.length);
+	keep[0] = keep[pts.length - 1] = 1;
+	const stack: Array<[number, number]> = [[0, pts.length - 1]];
+	while (stack.length) {
+		const [s, e] = stack.pop()!;
+		let maxD = -1;
+		let idx = -1;
+		for (let i = s + 1; i < e; i++) {
+			const d = distToSeg(pts[i].x, pts[i].y, pts[s], pts[e]);
+			if (d > maxD) {
+				maxD = d;
+				idx = i;
+			}
+		}
+		if (maxD > eps && idx > 0) {
+			keep[idx] = 1;
+			stack.push([s, idx], [idx, e]);
+		}
+	}
+	return pts.filter((_, i) => keep[i] === 1);
+}
+
+/**
+ * 笔迹美化：RDP 去抖（自适应阈值）→ 两轮 Chaikin 平滑。
+ * 与渲染层的中点平滑不同，这里先移除抖动再拟合，字迹明显更干净。
+ */
 function beautifyPoints(pts: Point[]): Point[] {
 	if (pts.length < 3) return pts;
-	const dense: Point[] = [pts[0]];
-	for (let i = 1; i < pts.length; i++) {
-		const prev = dense[dense.length - 1];
-		const q = pts[i];
-		if (Math.hypot(q.x - prev.x, q.y - prev.y) > 0.8) dense.push(q);
-	}
-	if (dense.length < 3) return pts;
-	let cur = chaikinOnce(dense);
+	const eps = Math.min(3, Math.max(1.2, pts.length * 0.008));
+	const simplified = rdpSimplify(pts, eps);
+	let cur = chaikinOnce(simplified);
 	cur = chaikinOnce(cur);
 	return cur;
 }
@@ -587,13 +610,11 @@ class InkOverlay {
 
 	private mount(): void {
 		if (this.destroyed) return;
-		this.unmount();
 		const scroller = this.findScroller();
 		if (!scroller) {
 			Diag.log("mount 跳过：未找到滚动容器");
 			return;
 		}
-		this.scroller = scroller;
 		this.candCache = null;
 		Diag.log(
 			`mount 容器=${scroller.className.slice(0, 50)} w=${scroller.clientWidth} h=${scroller.scrollHeight} strokes=${this.strokes.length}`
@@ -603,24 +624,34 @@ class InkOverlay {
 		content.addClass("free-doodle-positioned");
 		scroller.addClass("free-doodle-positioned");
 
-		const wrap = scroller.createDiv({ cls: "free-doodle-overlay" });
-		wrap.toggleClass("is-interactive", this.interactive);
-		const canvas = wrap.createEl("canvas", { cls: "free-doodle-canvas" });
-		this.wrap = wrap;
-		this.canvas = canvas;
-		this.ctx = canvas.getContext("2d");
-		// 关键：新画布必须重新计算尺寸。清空缓存，防止 applySize 因新旧尺寸恰好相同而跳过，
-		// 导致画布停留在 300x150 默认值、墨迹被裁剪“消失”
-		this.cw = 0;
-		this.ch = 0;
+		if (this.wrap && this.canvas && this.ctx) {
+			// 迁移已有画布节点：像素保留，避免重挂载时墨迹短暂消失
+			scroller.appendChild(this.wrap);
+			this.scroller = scroller;
+		} else {
+			this.unmount();
+			this.scroller = scroller;
+			const wrap = scroller.createDiv({ cls: "free-doodle-overlay" });
+			wrap.toggleClass("is-interactive", this.interactive);
+			const canvas = wrap.createEl("canvas", { cls: "free-doodle-canvas" });
+			this.wrap = wrap;
+			this.canvas = canvas;
+			this.ctx = canvas.getContext("2d");
+			this.cw = 0;
+			this.ch = 0;
 
-		canvas.addEventListener("pointerdown", this.onDown);
-		canvas.addEventListener("pointermove", this.onMove);
-		canvas.addEventListener("pointerup", this.onUp);
-		canvas.addEventListener("pointercancel", this.onCancel);
+			canvas.addEventListener("pointerdown", this.onDown);
+			canvas.addEventListener("pointermove", this.onMove);
+			canvas.addEventListener("pointerup", this.onUp);
+			canvas.addEventListener("pointercancel", this.onCancel);
+		}
 
 		this.applySize();
-		if (this.interactive) this.buildToolbar();
+		if (this.interactive && !this.toolbar) this.buildToolbar();
+		else if (!this.interactive && this.toolbar) {
+			this.toolbar.remove();
+			this.toolbar = null;
+		}
 		this.redraw();
 		this.watchDom();
 
@@ -1008,6 +1039,13 @@ class InkOverlay {
 		};
 		r.onerror = (ev: { error: string }) => {
 			Diag.log(`voice error: ${ev.error}`);
+			if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+				new Notice("语音识别权限被拒绝，请在系统设置中允许麦克风");
+			} else if (ev.error === "no-speech") {
+				new Notice("未检测到语音");
+			} else if (ev.error !== "aborted") {
+				new Notice(`语音识别出错：${ev.error}`);
+			}
 		};
 		r.onend = () => {
 			this.recognizing = false;
@@ -1108,9 +1146,13 @@ class InkOverlay {
 			const s = this.current;
 			const ctx = this.ctx;
 			if (!s || !ctx || this.destroyed) return;
-			// 统一使用与最终提交完全相同的绘制路径，拖动中即所见即所得
+			let draw = s;
+			// 拖动中实时预览美化结果（自由笔迹 + 开启优化时）
+			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
+				draw = { ...s, points: beautifyPoints(s.points) };
+			}
 			this.redraw();
-			drawStroke(ctx, s);
+			drawStroke(ctx, draw);
 		});
 	}
 
@@ -2035,8 +2077,12 @@ class DoodleView extends ItemView {
 			this.previewScheduled = false;
 			const s = this.current;
 			if (!s || !this.ctx || !this.containerEl.isConnected) return;
+			let draw = s;
+			if (!s.erase && !s.shape && this.smooth && s.points.length > 6 && s.points.length < 4000) {
+				draw = { ...s, points: beautifyPoints(s.points) };
+			}
 			this.redraw();
-			drawStroke(this.ctx, s);
+			drawStroke(this.ctx, draw);
 		});
 	}
 
