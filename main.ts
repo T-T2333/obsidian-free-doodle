@@ -7,6 +7,8 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	SettingDefinition,
+	SettingDefinitionItem,
 	TFile,
 	WorkspaceLeaf,
 	normalizePath,
@@ -104,6 +106,42 @@ function isVisible(el: HTMLElement): boolean {
 
 function normText(s: string): string {
 	return s.replace(/\s+/g, " ").trim();
+}
+
+interface CaretHit {
+	node: Node;
+	offset: number;
+}
+
+// 独立接口：不与 Document 交叉，避免合并回库内已弃用的成员声明
+interface CaretLegacyDoc {
+	caretRangeFromPoint?: (x: number, y: number) => Range | null;
+}
+
+interface CaretModernDoc {
+	caretPositionFromPoint?:
+		| ((x: number, y: number) => { offsetNode: Node; offset: number } | null)
+		| undefined;
+}
+
+/**
+ * 标准优先的命中测试：caretPositionFromPoint（现代标准），
+ * 回退到旧引擎的 caretRangeFromPoint（Obsidian 1.7.x 内核）。
+ */
+function resolveCaretHit(
+	doc: Document,
+	x: number,
+	y: number
+): CaretHit | null {
+	const modern = doc as unknown as CaretModernDoc;
+	if (typeof modern.caretPositionFromPoint === "function") {
+		const pos = modern.caretPositionFromPoint(x, y);
+		return pos ? { node: pos.offsetNode, offset: pos.offset } : null;
+	}
+	const legacy = doc as unknown as CaretLegacyDoc;
+	if (!legacy.caretRangeFromPoint) return null;
+	const range = legacy.caretRangeFromPoint(x, y);
+	return range ? { node: range.startContainer, offset: range.startOffset } : null;
 }
 
 /** 内置诊断日志：环形缓冲，设置页可查看/复制 */
@@ -879,38 +917,20 @@ class InkOverlay {
 			const cRect = canvas.getBoundingClientRect();
 			const p = s.points[0];
 			// 使用画布所在文档：兼容笔记弹出到独立窗口的场景
-			const doc = canvas.ownerDocument as Document & {
-				caretRangeFromPoint?: (x: number, y: number) => Range | null;
-				caretPositionFromPoint?: (
-					x: number,
-					y: number
-				) => { offsetNode: Node; offset: number } | null;
-			};
-			if (!doc.caretRangeFromPoint && !doc.caretPositionFromPoint) return;
-			// 关键：临时让画布对命中测试透明，否则只会命中画布自身而非下方文字
 			canvas.addClass("hit-test-off");
-			let hitNode: Node | null = null;
-			let hitOffset = 0;
+			let hit: CaretHit | null = null;
 			try {
-				if (doc.caretPositionFromPoint) {
-					const pos = doc.caretPositionFromPoint(cRect.left + p.x, cRect.top + p.y);
-					if (pos) {
-						hitNode = pos.offsetNode;
-						hitOffset = pos.offset;
-					}
-				} else if (doc.caretRangeFromPoint) {
-					const range = doc.caretRangeFromPoint(cRect.left + p.x, cRect.top + p.y);
-					if (range) {
-						hitNode = range.startContainer;
-						hitOffset = range.startOffset;
-					}
-				}
+				hit = resolveCaretHit(
+					canvas.ownerDocument,
+					cRect.left + p.x,
+					cRect.top + p.y
+				);
 			} finally {
 				canvas.removeClass("hit-test-off");
 			}
-			if (!hitNode) return;
-			let node: Node = hitNode;
-			let offset = hitOffset;
+			if (!hit) return;
+			let node: Node = hit.node;
+			let offset = hit.offset;
 			if (node.nodeType !== Node.TEXT_NODE) {
 				node = node.childNodes[offset] ?? node;
 			}
@@ -1918,15 +1938,85 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 		this.buildDiagnostics(containerEl);
 	}
 
+	getControlValue(key: string): unknown {
+		return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+	}
+
+	setControlValue(key: string, value: unknown): void {
+		const settings = this.plugin.settings as unknown as Record<string, unknown>;
+		if (key === "saveFolder" && typeof value === "string") {
+			value = value.trim() || DEFAULT_SETTINGS.saveFolder;
+		}
+		settings[key] = value;
+		void this.plugin.saveSettings();
+	}
+
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const generalGroup: SettingDefinitionItem = {
+			type: "group",
+			heading: "Annotate / 涂鸦",
+			items: [
+				{
+					name: "Default pen color 默认画笔颜色",
+					desc: "Initial color when entering annotate mode. 进入涂鸦模式时的初始颜色。",
+					control: {
+						type: "color",
+						key: "penColor",
+						defaultValue: DEFAULT_SETTINGS.penColor,
+					},
+				},
+				{
+					name: "Default pen size 默认画笔粗细",
+					desc: "Width in px, 1 - 40. 粗细（像素）。",
+					control: {
+						type: "slider",
+						key: "penSize",
+						min: 1,
+						max: 40,
+						step: 1,
+						defaultValue: DEFAULT_SETTINGS.penSize,
+					},
+				},
+				{
+					name: "Board PNG folder 独立画板图片文件夹",
+					desc: "Relative vault path, created automatically. 库内相对路径，不存在时自动创建。",
+					control: {
+						type: "text",
+						key: "saveFolder",
+						placeholder: "涂鸦",
+						defaultValue: DEFAULT_SETTINGS.saveFolder,
+					},
+				},
+				{
+					name: "Open standalone board 打开独立画板",
+					desc: "Full-screen doodle board with PNG export. 全屏涂鸦画板，可导出 PNG 并插入笔记。",
+					action: () => {
+						void this.plugin.activateBoard();
+					},
+				},
+			],
+		};
+		const diagnostics: SettingDefinition = {
+			name: "Diagnostics 诊断日志",
+			desc: "Overlay mount/save events and live canvas state. 覆盖层事件与画布实时状态。",
+			render: (setting) => {
+				this.mountDiagnostics(setting.controlEl);
+			},
+		};
+		return [generalGroup, diagnostics];
+	}
+
 	private buildDiagnostics(containerEl: HTMLElement): void {
 		new Setting(containerEl).setName("诊断日志").setHeading();
+		this.mountDiagnostics(containerEl);
+	}
 
-		const textarea = containerEl.createEl("textarea", {
+	private mountDiagnostics(parent: HTMLElement): void {
+		const textarea = parent.createEl("textarea", {
 			cls: "free-doodle-diag",
 			attr: { readonly: "true", spellcheck: "false" },
 		});
 		textarea.rows = 16;
-
 		const refresh = () => {
 			const lines: string[] = [Diag.dump()];
 			lines.push(`---- 实时状态 ----`);
@@ -1944,7 +2034,7 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 			textarea.value = lines.filter((l) => l.length > 0).join("\n");
 		};
 
-		new Setting(containerEl)
+		new Setting(parent)
 			.setName("诊断日志")
 			.setDesc("记录覆盖层挂载/保存/销毁等关键事件与画布实时状态")
 			.addButton((b) =>
