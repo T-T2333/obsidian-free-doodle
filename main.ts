@@ -406,21 +406,6 @@ function drawStrokes(ctx: CanvasRenderingContext2D, strokes: Stroke[]): void {
 	for (const s of strokes) drawStroke(ctx, s);
 }
 
-/* ---------- 笔迹美化（去抖 + 平滑拟合） ---------- */
-
-function chaikinOnce(pts: Point[]): Point[] {
-	if (pts.length < 3) return pts;
-	const out: Point[] = [pts[0]];
-	for (let i = 0; i < pts.length - 1; i++) {
-		const p = pts[i];
-		const q = pts[i + 1];
-		out.push({ x: p.x * 0.75 + q.x * 0.25, y: p.y * 0.75 + q.y * 0.25 });
-		out.push({ x: p.x * 0.25 + q.x * 0.75, y: p.y * 0.25 + q.y * 0.75 });
-	}
-	out.push(pts[pts.length - 1]);
-	return out;
-}
-
 /** RDP 抽稀：去掉手抖产生的高频抖动点 */
 function rdpSimplify(pts: Point[], eps: number): Point[] {
 	if (pts.length < 3) return pts;
@@ -447,17 +432,21 @@ function rdpSimplify(pts: Point[], eps: number): Point[] {
 }
 
 /**
- * 笔迹美化：RDP 去抖（自适应阈值）→ 两轮 Chaikin 平滑。
- * 与渲染层的中点平滑不同，这里先移除抖动再拟合，字迹明显更干净。
+ * 指数平滑（EMA）：逐点 O(1)、输出单调稳定，用于捕获期实时平滑。
+ * 稳定性 0-100 → 平滑系数：越高越顺滑（跟随稍延迟）。
  */
-function beautifyPoints(pts: Point[], stability = 50, rounds = 2): Point[] {
-	if (pts.length < 3) return pts;
-	const eps = 1.4 + (stability / 100) * 2.0;
-	const simplified = rdpSimplify(pts, eps);
-	let cur = chaikinOnce(simplified);
-	for (let i = 1; i < rounds && stability >= 40; i++) cur = chaikinOnce(cur);
-	return cur;
+function emaSmooth(
+	prev: Point,
+	p: Point,
+	stability: number
+): Point {
+	const alpha = 0.9 - (Math.max(0, Math.min(100, stability)) / 100) * 0.72;
+	return {
+		x: prev.x + (p.x - prev.x) * alpha,
+		y: prev.y + (p.y - prev.y) * alpha,
+	};
 }
+
 
 
 function countCorners(pts: Point[], minTurnDeg: number): number {
@@ -971,7 +960,7 @@ class InkOverlay {
 		);
 
 		this.toolBtnEls["fit"] = mkBtn(
-			"ruler",
+			"check-check",
 			"一键修正：最后一笔拟合为直线/矩形/椭圆",
 			() => this.fitLast()
 		);
@@ -1098,6 +1087,59 @@ class InkOverlay {
 		};
 		this.popCloser = closer;
 		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
+	}
+
+	private startLaser(): void {
+		this.laserPts = [];
+		if (!this.laserRunning) {
+			this.laserRunning = true;
+			window.requestAnimationFrame(() => this.laserLoop());
+		}
+	}
+
+	private pushLaser(p: Point): void {
+		this.laserPts.push({ x: p.x, y: p.y, t: performance.now() });
+	}
+
+	private laserLoop(): void {
+		if (this.destroyed || !this.ctx) {
+			this.laserRunning = false;
+			return;
+		}
+		const now = performance.now();
+		const fade = 900;
+		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
+		this.paint();
+		const cfg = this.plugin.settings.brushes.laser;
+		const ctx = this.ctx;
+		ctx.save();
+		ctx.globalCompositeOperation = "lighter";
+		ctx.lineCap = "round";
+		for (let i = 1; i < this.laserPts.length; i++) {
+			const p0 = this.laserPts[i - 1];
+			const p1 = this.laserPts[i];
+			const a = Math.max(0, 1 - (now - p1.t) / fade);
+			ctx.globalAlpha = a * cfg.opacity;
+			ctx.lineWidth = cfg.size * (0.4 + 0.6 * a);
+			ctx.strokeStyle = this.tool.color;
+			ctx.beginPath();
+			ctx.moveTo(p0.x, p0.y);
+			ctx.lineTo(p1.x, p1.y);
+			ctx.stroke();
+		}
+		const tip = this.laserPts[this.laserPts.length - 1];
+		if (tip && now - tip.t < fade * 0.6) {
+			ctx.globalAlpha = 1;
+			ctx.fillStyle = "#ffffff";
+			ctx.shadowColor = this.tool.color;
+			ctx.shadowBlur = cfg.size * 2;
+			ctx.beginPath();
+			ctx.arc(tip.x, tip.y, Math.max(2, cfg.size * 0.5), 0, Math.PI * 2);
+			ctx.fill();
+		}
+		ctx.restore();
+		if (this.laserPts.length > 0) window.requestAnimationFrame(() => this.laserLoop());
+		else this.laserRunning = false;
 	}
 
 	private openStylePopover(anchor: HTMLElement): void {
@@ -1396,6 +1438,10 @@ class InkOverlay {
 		canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
 
+		if (this.tool.mode === "laser") {
+			this.startLaser();
+			return;
+		}
 		if (this.tool.mode === "text") {
 			this.beginTextAt(p);
 			return;
@@ -1473,6 +1519,9 @@ class InkOverlay {
 
 	private strokeEraseUndoArmed = false;
 
+	private laserPts: Array<{ x: number; y: number; t: number }> = [];
+	private laserRunning = false;
+
 	private removeStrokesNear(p: Point): number {
 		const entries = this.getCandidateEntries();
 		let removed = 0;
@@ -1514,13 +1563,30 @@ class InkOverlay {
 		return removed;
 	}
 
-	private stabilizedForPreview(s: Stroke): Stroke {
-		if (!this.smooth || s.erase || s.shape) return s;
-		const pts = s.points;
-		if (pts.length < 10 || pts.length > 1200) return s;
-		const cut = Math.max(0, pts.length - 10);
-		const head = beautifyPoints(pts.slice(0, cut + 1), this.curCfg().stability, 1);
-		return { ...s, points: [...head, ...pts.slice(cut + 1)] };
+	private inkCanvas: HTMLCanvasElement | null = null;
+	private inkCtx: CanvasRenderingContext2D | null = null;
+	private inkCount = -1;
+
+	/** 当前笔迹渲染到独立图层（满透明度），合成时叠加真实不透明度：无端点残影、无抖动 */
+	private renderInkLayer(s: Stroke): void {
+		if (!this.inkCanvas || !this.inkCtx) {
+			this.inkCanvas = document.createElement("canvas");
+			this.inkCtx = this.inkCanvas.getContext("2d");
+		}
+		const ic = this.inkCanvas;
+		const ictx = this.inkCtx!;
+		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const tw = Math.floor(this.cw * dpr);
+		const th = Math.floor(this.ch * dpr);
+		if (ic.width !== tw || ic.height !== th) {
+			ic.width = tw;
+			ic.height = th;
+			this.inkCount = -1;
+		}
+		ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ictx.clearRect(0, 0, this.cw, this.ch);
+		drawStroke(ictx, s);
+		this.inkCount = s.points.length;
 	}
 
 	private schedulePreview(): void {
@@ -1532,13 +1598,26 @@ class InkOverlay {
 			const ctx = this.ctx;
 			if (!s || !ctx || this.destroyed) return;
 			this.paint();
-			drawStroke(ctx, this.stabilizedForPreview(s));
+			if (s.erase || s.shape || s.text) {
+				drawStroke(ctx, s);
+				return;
+			}
+			if (s.points.length !== this.inkCount) this.renderInkLayer(s);
+			ctx.save();
+			ctx.globalAlpha = s.alpha ?? 1;
+			ctx.drawImage(this.inkCanvas!, 0, 0, this.cw, this.ch);
+			ctx.restore();
 		});
 	}
 
 	private onMove = (evt: PointerEvent): void => {
-		const s = this.current;
 		if (!evt.isPrimary) return;
+		if (this.tool.mode === "laser") {
+			this.pushLaser(this.toPoint(evt));
+			return;
+		}
+		const s = this.current;
+		if (!s) return;
 
 		if (!s && this.interactive && this.tool.mode === "eraseStroke") {
 			this.removeStrokesNear(this.toPoint(evt));
@@ -1549,12 +1628,13 @@ class InkOverlay {
 		if (s.shape) {
 			s.points[1] = this.toPoint(evt);
 		} else {
-			const prev = s.points[s.points.length - 1];
-			const cur = this.toPoint(evt);
-			s.points.push(cur);
+			const raw = this.toPoint(evt);
+			const prev = s.points[s.points.length - 1] ?? raw;
+			const sm = emaSmooth(prev, raw, this.curCfg().stability);
+			s.points.push(sm);
 			if (s.brush === "pen" && s.w) {
-				// 速度感应宽度：越慢越粗
-				const speed = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+				// 速度感应宽度：越慢越粗（基于平滑后坐标）
+				const speed = Math.hypot(sm.x - prev.x, sm.y - prev.y);
 				const base = this.curCfg().size;
 				s.w.push(Math.max(base * 0.45, Math.min(base * 1.5, base * (1.45 - speed * 0.03))));
 			}
@@ -1563,6 +1643,7 @@ class InkOverlay {
 	};
 
 	private onUp = (): void => {
+		if (this.tool.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
 		if (!s) return;
 		this.current = null;
@@ -1574,13 +1655,8 @@ class InkOverlay {
 			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
 		}
 
-		// 笔迹优化：去抖 + 平滑拟合（强度由稳定性参数决定）
+		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
 		let final: Stroke = s;
-		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
-			final = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
-		}
-
-		// 自动几何拟合
 		if (this.plugin.settings.autoFit) {
 			const fitted = fitFreehand(final);
 			if (fitted) final = fitted;
@@ -2252,6 +2328,59 @@ class DoodleView extends ItemView {
 		this.syncToolbar();
 	}
 
+	private startLaser(): void {
+		this.laserPts = [];
+		if (!this.laserRunning) {
+			this.laserRunning = true;
+			window.requestAnimationFrame(() => this.laserLoop());
+		}
+	}
+
+	private pushLaser(p: Point): void {
+		this.laserPts.push({ x: p.x, y: p.y, t: performance.now() });
+	}
+
+	private laserLoop(): void {
+		if (!this.ctx || !this.containerEl.isConnected) {
+			this.laserRunning = false;
+			return;
+		}
+		const now = performance.now();
+		const fade = 900;
+		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
+		this.paint();
+		const cfg = this.plugin.settings.brushes.laser;
+		const ctx = this.ctx;
+		ctx.save();
+		ctx.globalCompositeOperation = "lighter";
+		ctx.lineCap = "round";
+		for (let i = 1; i < this.laserPts.length; i++) {
+			const p0 = this.laserPts[i - 1];
+			const p1 = this.laserPts[i];
+			const a = Math.max(0, 1 - (now - p1.t) / fade);
+			ctx.globalAlpha = a * cfg.opacity;
+			ctx.lineWidth = cfg.size * (0.4 + 0.6 * a);
+			ctx.strokeStyle = this.color;
+			ctx.beginPath();
+			ctx.moveTo(p0.x, p0.y);
+			ctx.lineTo(p1.x, p1.y);
+			ctx.stroke();
+		}
+		const tip = this.laserPts[this.laserPts.length - 1];
+		if (tip && now - tip.t < fade * 0.6) {
+			ctx.globalAlpha = 1;
+			ctx.fillStyle = "#ffffff";
+			ctx.shadowColor = this.color;
+			ctx.shadowBlur = cfg.size * 2;
+			ctx.beginPath();
+			ctx.arc(tip.x, tip.y, Math.max(2, cfg.size * 0.5), 0, Math.PI * 2);
+			ctx.fill();
+		}
+		ctx.restore();
+		if (this.laserPts.length > 0) window.requestAnimationFrame(() => this.laserLoop());
+		else this.laserRunning = false;
+	}
+
 	private onBoardToolClick(id: BoardTool | "erase"): void {
 		if (id === "shape") {
 			this.openBoardShapePopover(this.toolBtnEls["shape"] ?? this.styleBtnEl);
@@ -2552,6 +2681,10 @@ class DoodleView extends ItemView {
 		this.canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
 
+		if (this.mode === "laser") {
+			this.startLaser();
+			return;
+		}
 		if (this.mode === "text") {
 			this.beginBoardTextAt(p);
 			return;
@@ -2622,6 +2755,9 @@ class DoodleView extends ItemView {
 
 	private strokeEraseUndoArmed = false;
 
+	private laserPts: Array<{ x: number; y: number; t: number }> = [];
+	private laserRunning = false;
+
 	private removeStrokesNear(p: Point): void {
 		let removed = 0;
 		for (let i = this.strokes.length - 1; i >= 0; i--) {
@@ -2655,13 +2791,30 @@ class DoodleView extends ItemView {
 		}
 	}
 
-	private stabilizedForPreview(s: Stroke): Stroke {
-		if (!this.smooth || s.erase || s.shape) return s;
-		const pts = s.points;
-		if (pts.length < 10 || pts.length > 1200) return s;
-		const cut = Math.max(0, pts.length - 10);
-		const head = beautifyPoints(pts.slice(0, cut + 1), this.curCfg().stability, 1);
-		return { ...s, points: [...head, ...pts.slice(cut + 1)] };
+	private inkCanvas: HTMLCanvasElement | null = null;
+	private inkCtx: CanvasRenderingContext2D | null = null;
+	private inkCount = -1;
+
+	/** 当前笔迹渲染到独立图层（满透明度），合成时叠加真实不透明度：无端点残影、无抖动 */
+	private renderInkLayer(s: Stroke): void {
+		if (!this.inkCanvas || !this.inkCtx) {
+			this.inkCanvas = document.createElement("canvas");
+			this.inkCtx = this.inkCanvas.getContext("2d");
+		}
+		const ic = this.inkCanvas;
+		const ictx = this.inkCtx!;
+		const dpr = Math.min(window.devicePixelRatio || 1, 2);
+		const tw = Math.floor(this.cw * dpr);
+		const th = Math.floor(this.ch * dpr);
+		if (ic.width !== tw || ic.height !== th) {
+			ic.width = tw;
+			ic.height = th;
+			this.inkCount = -1;
+		}
+		ictx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ictx.clearRect(0, 0, this.cw, this.ch);
+		drawStroke(ictx, s);
+		this.inkCount = s.points.length;
 	}
 
 	private schedulePreview(): void {
@@ -2672,13 +2825,25 @@ class DoodleView extends ItemView {
 			const s = this.current;
 			if (!s || !this.ctx || !this.containerEl.isConnected) return;
 			this.paint();
-			drawStroke(this.ctx, this.stabilizedForPreview(s));
+			if (s.erase || s.shape || s.text) {
+				drawStroke(this.ctx, s);
+				return;
+			}
+			if (s.points.length !== this.inkCount) this.renderInkLayer(s);
+			this.ctx.save();
+			this.ctx.globalAlpha = s.alpha ?? 1;
+			this.ctx.drawImage(this.inkCanvas!, 0, 0, this.cw, this.ch);
+			this.ctx.restore();
 		});
 	}
 
 	private onMove(evt: PointerEvent): void {
-		const s = this.current;
 		if (!evt.isPrimary) return;
+		if (this.mode === "laser") {
+			this.pushLaser(this.toPoint(evt));
+			return;
+		}
+		const s = this.current;
 
 		if (!s && this.mode === "eraseStroke") {
 			this.removeStrokesNear(this.toPoint(evt));
@@ -2702,6 +2867,7 @@ class DoodleView extends ItemView {
 	}
 
 	private onUp(): void {
+		if (this.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
 		if (!s) return;
 		this.current = null;
@@ -2712,11 +2878,8 @@ class DoodleView extends ItemView {
 			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
 		}
 
+		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
 		let final: Stroke = s;
-		if (!s.erase && !s.shape && this.smooth && s.points.length > 2) {
-			final = { ...s, points: beautifyPoints(s.points, this.curCfg().stability) };
-		}
-
 		if (this.plugin.settings.autoFit) {
 			const fitted = fitFreehand(final);
 			if (fitted) final = fitted;
