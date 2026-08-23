@@ -1138,8 +1138,12 @@ class InkOverlay {
 			ctx.fill();
 		}
 		ctx.restore();
-		if (this.laserPts.length > 0) window.requestAnimationFrame(() => this.laserLoop());
-		else this.laserRunning = false;
+		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
+		if (this.laserPts.length > 0 || this.tool.mode === "laser") {
+			window.requestAnimationFrame(() => this.laserLoop());
+		} else {
+			this.laserRunning = false;
+		}
 	}
 
 	private openStylePopover(anchor: HTMLElement): void {
@@ -2377,8 +2381,12 @@ class DoodleView extends ItemView {
 			ctx.fill();
 		}
 		ctx.restore();
-		if (this.laserPts.length > 0) window.requestAnimationFrame(() => this.laserLoop());
-		else this.laserRunning = false;
+		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
+		if (this.laserPts.length > 0 || this.mode === "laser") {
+			window.requestAnimationFrame(() => this.laserLoop());
+		} else {
+			this.laserRunning = false;
+		}
 	}
 
 	private onBoardToolClick(id: BoardTool | "erase"): void {
