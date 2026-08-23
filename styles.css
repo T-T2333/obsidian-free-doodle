@@ -133,6 +133,28 @@
 	background-color: var(--interactive-accent-hover);
 }
 
+.free-doodle-text-pop {
+	flex-direction: row;
+	align-items: center;
+	gap: 6px;
+}
+
+.free-doodle-text-input {
+	flex: 1;
+	min-width: 180px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background: var(--background-primary);
+	color: var(--text-normal);
+	padding: 3px 8px;
+	font-size: var(--font-ui-medium);
+}
+
+.free-doodle-text-input:focus {
+	border-color: var(--interactive-accent);
+	outline: none;
+}
+
 .free-doodle-inline {
 	margin: 8px 0;
 	line-height: 0;

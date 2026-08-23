@@ -1007,21 +1007,21 @@ class InkOverlay {
 	}
 
 	private fitLast(): void {
-		const last = this.strokes[this.strokes.length - 1];
-		if (!last) {
-			new Notice("暂无可修正的笔画");
+		// 从最后一笔向前找到最近的可拟合自由笔迹（跳过形状/文本/擦除笔）
+		for (let i = this.strokes.length - 1; i >= 0; i--) {
+			const s = this.strokes[i];
+			if (s.erase || s.shape || s.text) continue;
+			const fitted = fitFreehand(s);
+			if (!fitted) continue;
+			this.undoStack.push(this.strokes.slice());
+			this.redoStack.length = 0;
+			this.strokes[i] = fitted;
+			this.syncTool();
+			this.redraw();
+			this.scheduleSave();
 			return;
 		}
-		const fitted = fitFreehand(last);
-		if (!fitted) {
-			new Notice("最近的笔画无法拟合为规则图形");
-			return;
-		}
-		this.undoStack.push(this.strokes.slice());
-		this.redoStack.length = 0;
-		this.strokes[this.strokes.length - 1] = fitted;
-		this.redraw();
-		this.scheduleSave();
+		new Notice("最近的自由笔迹无法拟合为规则图形");
 	}
 
 	private onToolClick(
@@ -1392,6 +1392,10 @@ class InkOverlay {
 			this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
 		if (this.opacityLabelEl)
 			this.opacityLabelEl.setText(`${Math.round(this.tool.opacity * 100)}%`);
+		const undoBtn = this.toolBtnEls["undo"] as HTMLButtonElement | undefined;
+		if (undoBtn) undoBtn.disabled = this.undoStack.length === 0;
+		const redoBtn = this.toolBtnEls["redo"] as HTMLButtonElement | undefined;
+		if (redoBtn) redoBtn.disabled = this.redoStack.length === 0;
 	}
 
 	private toggleVoice(): void {
@@ -1555,7 +1559,18 @@ class InkOverlay {
 			const px = p.x - dx;
 			const py = p.y - dy;
 			let hit = false;
-			if (!s.shape) {
+			if (s.text && s.points.length >= 1) {
+				// 文本标注：按估算文本框命中
+				const p0 = s.points[0];
+				const fs = Math.max(12, s.size * 4);
+				const wEst = s.text.length * fs * 0.6;
+				const hEst = fs * 1.35;
+				hit =
+					px >= p0.x - th &&
+					px <= p0.x + wEst + th &&
+					py >= p0.y - th &&
+					py <= p0.y + hEst + th;
+			} else if (!s.shape) {
 				for (const q of s.points) {
 					const ddx = q.x - px;
 					const ddy = q.y - py;
@@ -1692,6 +1707,7 @@ class InkOverlay {
 		this.strokes.push(final);
 		this.redraw();
 		this.scheduleSave();
+		this.syncTool();
 	};
 
 	private onCancel = (): void => {
@@ -1708,16 +1724,17 @@ class InkOverlay {
 		this.strokes = prev;
 		this.redraw();
 		this.scheduleSave();
+		this.syncTool();
 	}
 
 	private redo(): void {
 		const next = this.redoStack.pop();
 		if (!next) return;
 		this.undoStack.push(this.strokes.slice());
-		this.redoStack.length = 0;
 		this.strokes = next;
 		this.redraw();
 		this.scheduleSave();
+		this.syncTool();
 	}
 
 	private clearAll(): void {
@@ -1727,6 +1744,7 @@ class InkOverlay {
 		this.strokes = [];
 		this.redraw();
 		this.flushSave();
+		this.syncTool();
 	}
 
 	clearAllForRemove(): void {
@@ -2458,6 +2476,10 @@ class DoodleView extends ItemView {
 		if (this.colorInputEl) this.colorInputEl.value = this.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
+		const undoBtn2 = this.toolBtnEls["undo"] as HTMLButtonElement | undefined;
+		if (undoBtn2) undoBtn2.disabled = this.undoStack.length === 0;
+		const redoBtn2 = this.toolBtnEls["redo"] as HTMLButtonElement | undefined;
+		if (redoBtn2) redoBtn2.disabled = this.redoStack.length === 0;
 	}
 
 	private closePopover(): void {
@@ -2703,15 +2725,16 @@ class DoodleView extends ItemView {
 		this.redoStack.push(this.strokes.slice());
 		this.strokes = prev;
 		this.redraw();
+		this.syncToolbar();
 	}
 
 	private redo(): void {
 		const next = this.redoStack.pop();
 		if (!next) return;
 		this.undoStack.push(this.strokes.slice());
-		this.redoStack.length = 0;
 		this.strokes = next;
 		this.redraw();
+		this.syncToolbar();
 	}
 
 	private clear(): void {
@@ -2818,7 +2841,18 @@ class DoodleView extends ItemView {
 			if (s.erase) continue;
 			const th = Math.max(10, s.size) + 6;
 			let hit = false;
-			if (!s.shape) {
+			if (s.text && s.points.length >= 1) {
+				// 文本标注：按估算文本框命中
+				const p0 = s.points[0];
+				const fs = Math.max(12, s.size * 4);
+				const wEst = s.text.length * fs * 0.6;
+				const hEst = fs * 1.35;
+				hit =
+					p.x >= p0.x - th &&
+					p.x <= p0.x + wEst + th &&
+					p.y >= p0.y - th &&
+					p.y <= p0.y + hEst + th;
+			} else if (!s.shape) {
 				for (const q of s.points) {
 					const ddx = q.x - p.x;
 					const ddy = q.y - p.y;
