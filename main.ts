@@ -1111,23 +1111,25 @@ class InkOverlay {
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
 		if (this.laserPts.length > 1) {
-			// 单路径渲染：整条轨迹统一透明度，随最新点年龄整体淡出（无逐段叠加圆点）
 			const cfg = this.plugin.settings.brushes.laser;
 			const ctx = this.ctx;
-			const newest = this.laserPts[this.laserPts.length - 1].t;
-			const life = Math.max(0, 1 - (now - newest) / fade);
 			ctx.save();
-			ctx.globalCompositeOperation = "lighter";
-			ctx.globalAlpha = life * cfg.opacity;
-			ctx.strokeStyle = this.tool.color;
-			ctx.lineWidth = cfg.size;
 			ctx.lineCap = "round";
 			ctx.lineJoin = "round";
-			ctx.beginPath();
-			ctx.moveTo(this.laserPts[0].x, this.laserPts[0].y);
-			for (let i = 1; i < this.laserPts.length; i++)
-				ctx.lineTo(this.laserPts[i].x, this.laserPts[i].y);
-			ctx.stroke();
+			ctx.strokeStyle = this.tool.color;
+			for (let i = 1; i < this.laserPts.length; i++) {
+				const p0 = this.laserPts[i - 1];
+				const p1 = this.laserPts[i];
+				const age = (now - p1.t) / fade;
+				if (age >= 1) continue;
+				// 先画的先淡出：每段透明度取决于自身年龄
+				ctx.globalAlpha = (1 - age) * cfg.opacity;
+				ctx.lineWidth = cfg.size * (0.55 + 0.45 * (1 - age));
+				ctx.beginPath();
+				ctx.moveTo(p0.x, p0.y);
+				ctx.lineTo(p1.x, p1.y);
+				ctx.stroke();
+			}
 			ctx.restore();
 		}
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
@@ -1435,6 +1437,7 @@ class InkOverlay {
 		const p = this.toPoint(evt);
 
 		if (this.tool.mode === "laser") {
+			this.laserDown = true;
 			this.startLaser();
 			return;
 		}
@@ -1517,6 +1520,7 @@ class InkOverlay {
 
 	private laserPts: Array<{ x: number; y: number; t: number }> = [];
 	private laserRunning = false;
+	private laserDown = false;
 
 	private removeStrokesNear(p: Point): number {
 		const entries = this.getCandidateEntries();
@@ -1609,7 +1613,7 @@ class InkOverlay {
 	private onMove = (evt: PointerEvent): void => {
 		if (!evt.isPrimary) return;
 		if (this.tool.mode === "laser") {
-			this.pushLaser(this.toPoint(evt));
+			if (this.laserDown) this.pushLaser(this.toPoint(evt));
 			return;
 		}
 		const s = this.current;
@@ -1639,6 +1643,7 @@ class InkOverlay {
 	};
 
 	private onUp = (): void => {
+		this.laserDown = false;
 		if (this.tool.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
 		if (!s) return;
@@ -1668,6 +1673,7 @@ class InkOverlay {
 	};
 
 	private onCancel = (): void => {
+		this.laserDown = false;
 		this.current = null;
 	};
 
@@ -2241,6 +2247,7 @@ class DoodleView extends ItemView {
 		);
 		this.registerDomEvent(this.canvas, "pointerup", () => this.onUp());
 		this.registerDomEvent(this.canvas, "pointercancel", () => {
+			this.laserDown = false;
 			this.current = null;
 		});
 		this.registerDomEvent(this.canvas, "contextmenu", (evt: MouseEvent) =>
@@ -2346,23 +2353,25 @@ class DoodleView extends ItemView {
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
 		if (this.laserPts.length > 1) {
-			// 单路径渲染：整条轨迹统一透明度，随最新点年龄整体淡出（无逐段叠加圆点）
 			const cfg = this.plugin.settings.brushes.laser;
 			const ctx = this.ctx;
-			const newest = this.laserPts[this.laserPts.length - 1].t;
-			const life = Math.max(0, 1 - (now - newest) / fade);
 			ctx.save();
-			ctx.globalCompositeOperation = "lighter";
-			ctx.globalAlpha = life * cfg.opacity;
-			ctx.strokeStyle = this.color;
-			ctx.lineWidth = cfg.size;
 			ctx.lineCap = "round";
 			ctx.lineJoin = "round";
-			ctx.beginPath();
-			ctx.moveTo(this.laserPts[0].x, this.laserPts[0].y);
-			for (let i = 1; i < this.laserPts.length; i++)
-				ctx.lineTo(this.laserPts[i].x, this.laserPts[i].y);
-			ctx.stroke();
+			ctx.strokeStyle = this.color;
+			for (let i = 1; i < this.laserPts.length; i++) {
+				const p0 = this.laserPts[i - 1];
+				const p1 = this.laserPts[i];
+				const age = (now - p1.t) / fade;
+				if (age >= 1) continue;
+				// 先画的先淡出：每段透明度取决于自身年龄
+				ctx.globalAlpha = (1 - age) * cfg.opacity;
+				ctx.lineWidth = cfg.size * (0.55 + 0.45 * (1 - age));
+				ctx.beginPath();
+				ctx.moveTo(p0.x, p0.y);
+				ctx.lineTo(p1.x, p1.y);
+				ctx.stroke();
+			}
 			ctx.restore();
 		}
 		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
@@ -2674,6 +2683,7 @@ class DoodleView extends ItemView {
 		const p = this.toPoint(evt);
 
 		if (this.mode === "laser") {
+			this.laserDown = true;
 			this.startLaser();
 			return;
 		}
@@ -2749,6 +2759,7 @@ class DoodleView extends ItemView {
 
 	private laserPts: Array<{ x: number; y: number; t: number }> = [];
 	private laserRunning = false;
+	private laserDown = false;
 
 	private removeStrokesNear(p: Point): void {
 		let removed = 0;
@@ -2832,7 +2843,7 @@ class DoodleView extends ItemView {
 	private onMove(evt: PointerEvent): void {
 		if (!evt.isPrimary) return;
 		if (this.mode === "laser") {
-			this.pushLaser(this.toPoint(evt));
+			if (this.laserDown) this.pushLaser(this.toPoint(evt));
 			return;
 		}
 		const s = this.current;
@@ -2859,6 +2870,7 @@ class DoodleView extends ItemView {
 	}
 
 	private onUp(): void {
+		this.laserDown = false;
 		if (this.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
 		if (!s) return;
