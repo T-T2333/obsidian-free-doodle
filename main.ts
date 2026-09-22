@@ -221,6 +221,30 @@ class Diag {
 	}
 }
 
+/**激光轨迹渲染前做一次 Chaikin 角点细分：平滑快速滑动的大转角，消除 butt 接缝缺口与透明度跳变 */
+function smoothLaserPts(
+	pts: Array<{ x: number; y: number; t: number }>
+): Array<{ x: number; y: number; t: number }> {
+	if (pts.length < 3) return pts;
+	const out: Array<{ x: number; y: number; t: number }> = [pts[0]];
+	for (let i = 0; i < pts.length - 1; i++) {
+		const a = pts[i];
+		const b = pts[i + 1];
+		out.push({
+			x: a.x * 0.75 + b.x * 0.25,
+			y: a.y * 0.75 + b.y * 0.25,
+			t: a.t * 0.75 + b.t * 0.25,
+		});
+		out.push({
+			x: a.x * 0.25 + b.x * 0.75,
+			y: a.y * 0.25 + b.y * 0.75,
+			t: a.t * 0.25 + b.t * 0.75,
+		});
+	}
+	out.push(pts[pts.length - 1]);
+	return out;
+}
+
 function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): void {
 	ctx.save();
 	if (dx !== 0 || dy !== 0) ctx.translate(dx, dy);
@@ -1122,15 +1146,16 @@ class InkOverlay {
 		this.paint();
 		const cfg = this.plugin.settings.brushes.laser;
 		const ctx = this.ctx;
-		if (this.laserPts.length > 1) {
+		const pts = smoothLaserPts(this.laserPts);
+		if (pts.length > 1) {
 			ctx.save();
 			ctx.lineCap = "butt";
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.tool.color;
 			ctx.lineWidth = cfg.size;
-			for (let i = 1; i < this.laserPts.length; i++) {
-				const p0 = this.laserPts[i - 1];
-				const p1 = this.laserPts[i];
+			for (let i = 1; i < pts.length; i++) {
+				const p0 = pts[i - 1];
+				const p1 = pts[i];
 				const age = (now - p1.t) / fade;
 				if (age >= 1) continue;
 				// 先画的先淡出：每段透明度取决于自身年龄（恒定线宽避免接缝）
@@ -1142,8 +1167,8 @@ class InkOverlay {
 			}
 			ctx.restore();
 		}
-		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
-		const tip = this.laserPts[this.laserPts.length - 1];
+		// 轨迹点淡出完毕且已松开时停止循环
+		const tip = pts[pts.length - 1];
 		if (tip) {
 			ctx.save();
 			ctx.globalAlpha = Math.max(0.3, 1 - (now - tip.t) / fade);
@@ -1511,6 +1536,12 @@ class InkOverlay {
 			left: `${Math.round(p.x)}px`,
 			top: `${Math.round(Math.max(4, p.y - 14))}px`,
 		});
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover === pop && !pop.contains(t)) this.closePopover();
+		};
+		this.popCloser = closer;
+		window.addEventListener("pointerdown", closer, true);
 		const input = pop.createEl("input", {
 			cls: "free-doodle-text-input",
 			attr: { placeholder: "输入文字后按回车确认", spellcheck: "false" },
@@ -1518,8 +1549,7 @@ class InkOverlay {
 		window.setTimeout(() => input.focus(), 30);
 		const commit = () => {
 			const t = input.value.trim();
-			pop.remove();
-			if (this.popover === pop) this.popover = null;
+			this.closePopover();
 			if (!t) return;
 			const st: Stroke = {
 				color: this.tool.color,
@@ -1531,17 +1561,14 @@ class InkOverlay {
 			};
 			this.attachAnchor(st);
 			this.undoStack.push(this.strokes.slice());
-		this.redoStack.length = 0;
+			this.redoStack.length = 0;
 			this.strokes.push(st);
 			this.redraw();
 			this.scheduleSave();
 		};
 		input.addEventListener("keydown", (e) => {
 			if (e.key === "Enter") commit();
-			else if (e.key === "Escape") {
-				pop.remove();
-				if (this.popover === pop) this.popover = null;
-			}
+			else if (e.key === "Escape") this.closePopover();
 		});
 		pop.createEl("button", { cls: "free-doodle-btn mod-cta", text: "确定" }).addEventListener(
 			"click",
@@ -2411,7 +2438,8 @@ class DoodleView extends ItemView {
 		const fade = 900;
 		this.laserPts = this.laserPts.filter((q) => now - q.t < fade);
 		this.paint();
-		if (this.laserPts.length > 1) {
+		const pts = smoothLaserPts(this.laserPts);
+		if (pts.length > 1) {
 			const cfg = this.plugin.settings.brushes.laser;
 			const ctx = this.ctx;
 			ctx.save();
@@ -2419,9 +2447,9 @@ class DoodleView extends ItemView {
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.color;
 			ctx.lineWidth = cfg.size;
-			for (let i = 1; i < this.laserPts.length; i++) {
-				const p0 = this.laserPts[i - 1];
-				const p1 = this.laserPts[i];
+			for (let i = 1; i < pts.length; i++) {
+				const p0 = pts[i - 1];
+				const p1 = pts[i];
 				const age = (now - p1.t) / fade;
 				if (age >= 1) continue;
 				// 先画的先淡出：每段透明度取决于自身年龄（恒定线宽避免接缝）
@@ -2433,8 +2461,8 @@ class DoodleView extends ItemView {
 			}
 			ctx.restore();
 		}
-		// 只要仍处于激光笔模式就保持循环存活（即使暂无轨迹点）
-		const tip = this.laserPts[this.laserPts.length - 1];
+		// 轨迹点淡出完毕且已松开时停止循环
+		const tip = pts[pts.length - 1];
 		if (tip) {
 			const ctx = this.ctx;
 			const cfgL = this.plugin.settings.brushes.laser;
@@ -2818,6 +2846,12 @@ class DoodleView extends ItemView {
 		this.popover = pop;
 		pop.style.left = `${Math.round(p.x)}px`;
 		pop.style.top = `${Math.round(Math.max(4, p.y - 14))}px`;
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover === pop && !pop.contains(t)) this.closePopover();
+		};
+		this.popCloser = closer;
+		window.addEventListener("pointerdown", closer, true);
 		const input = pop.createEl("input", {
 			cls: "free-doodle-text-input",
 			attr: { placeholder: "输入文字后按回车确认", spellcheck: "false" },
@@ -2825,8 +2859,7 @@ class DoodleView extends ItemView {
 		window.setTimeout(() => input.focus(), 30);
 		const commit = () => {
 			const t = input.value.trim();
-			pop.remove();
-			if (this.popover === pop) this.popover = null;
+			this.closePopover();
 			if (!t) return;
 			const st: Stroke = {
 				color: this.color,
@@ -2843,10 +2876,7 @@ class DoodleView extends ItemView {
 		};
 		input.addEventListener("keydown", (e) => {
 			if (e.key === "Enter") commit();
-			else if (e.key === "Escape") {
-				pop.remove();
-				if (this.popover === pop) this.popover = null;
-			}
+			else if (e.key === "Escape") this.closePopover();
 		});
 		pop.createEl("button", { cls: "free-doodle-btn mod-cta", text: "确定" }).addEventListener(
 			"click",
