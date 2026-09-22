@@ -1019,6 +1019,7 @@ class InkOverlay {
 			this.syncTool();
 			this.redraw();
 			this.scheduleSave();
+			new Notice("已修正为规则图形");
 			return;
 		}
 		new Notice("最近的自由笔迹无法拟合为规则图形");
@@ -1126,14 +1127,14 @@ class InkOverlay {
 			ctx.lineCap = "butt";
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.tool.color;
+			ctx.lineWidth = cfg.size;
 			for (let i = 1; i < this.laserPts.length; i++) {
 				const p0 = this.laserPts[i - 1];
 				const p1 = this.laserPts[i];
 				const age = (now - p1.t) / fade;
 				if (age >= 1) continue;
-				// 先画的先淡出：每段透明度取决于自身年龄
+				// 先画的先淡出：每段透明度取决于自身年龄（恒定线宽避免接缝）
 				ctx.globalAlpha = (1 - age) * cfg.opacity;
-				ctx.lineWidth = cfg.size * (0.55 + 0.45 * (1 - age));
 				ctx.beginPath();
 				ctx.moveTo(p0.x, p0.y);
 				ctx.lineTo(p1.x, p1.y);
@@ -1154,7 +1155,7 @@ class InkOverlay {
 			ctx.fill();
 			ctx.restore();
 		}
-		if (this.laserPts.length > 0 || this.tool.mode === "laser") {
+		if (this.laserPts.length > 0 || this.laserDown) {
 			window.requestAnimationFrame(() => this.laserLoop());
 		} else {
 			this.laserRunning = false;
@@ -1646,10 +1647,8 @@ class InkOverlay {
 				return;
 			}
 			if (s.points.length !== this.inkCount) this.renderInkLayer(s);
-			ctx.save();
-			ctx.globalAlpha = s.alpha ?? 1;
+			// ink 层内 drawStroke 已应用 alpha，合成时不能再乘一次
 			ctx.drawImage(this.inkCanvas!, 0, 0, this.cw, this.ch);
-			ctx.restore();
 		});
 	}
 
@@ -1804,23 +1803,10 @@ class InkOverlay {
 	private redraw(): void {
 		this.rebuildBase();
 		this.paint();
-		// 外部触发的重绘（DOM 变化/尺寸变化）也要保留进行中的笔迹
+		// 外部触发的重绘也要保留进行中的笔迹（drawStroke 覆盖形状/擦除/墨迹）
 		const s = this.current;
-		if (
-			s &&
-			!s.erase &&
-			!s.shape &&
-			s.points.length === this.inkCount &&
-			this.inkCanvas
-		) {
-			const ctx = this.ctx;
-			if (ctx) {
-				ctx.save();
-				ctx.globalAlpha = s.alpha ?? 1;
-				ctx.drawImage(this.inkCanvas, 0, 0, this.cw, this.ch);
-				ctx.restore();
-			}
-		}
+		if (s && this.ctx) drawStroke(this.ctx, s);
+		this.inkCount = -1;
 	}
 
 	private static readonly BLOCK_SEL = ".cm-line, p, li, h1, h2, h3, h4, h5, h6";
@@ -2432,14 +2418,14 @@ class DoodleView extends ItemView {
 			ctx.lineCap = "butt";
 			ctx.lineJoin = "round";
 			ctx.strokeStyle = this.color;
+			ctx.lineWidth = cfg.size;
 			for (let i = 1; i < this.laserPts.length; i++) {
 				const p0 = this.laserPts[i - 1];
 				const p1 = this.laserPts[i];
 				const age = (now - p1.t) / fade;
 				if (age >= 1) continue;
-				// 先画的先淡出：每段透明度取决于自身年龄
+				// 先画的先淡出：每段透明度取决于自身年龄（恒定线宽避免接缝）
 				ctx.globalAlpha = (1 - age) * cfg.opacity;
-				ctx.lineWidth = cfg.size * (0.55 + 0.45 * (1 - age));
 				ctx.beginPath();
 				ctx.moveTo(p0.x, p0.y);
 				ctx.lineTo(p1.x, p1.y);
@@ -2462,7 +2448,7 @@ class DoodleView extends ItemView {
 			ctx.fill();
 			ctx.restore();
 		}
-		if (this.laserPts.length > 0 || this.mode === "laser") {
+		if (this.laserPts.length > 0 || this.laserDown) {
 			window.requestAnimationFrame(() => this.laserLoop());
 		} else {
 			this.laserRunning = false;
@@ -2503,6 +2489,12 @@ class DoodleView extends ItemView {
 		if (penBtn) penBtn.toggleClass("is-active", this.mode === "pen");
 		const hlBtn = this.toolBtnEls["hl"];
 		if (hlBtn) hlBtn.toggleClass("is-active", this.mode === "hl");
+		for (const id of ["pencil", "ball", "marker", "laser"] as const) {
+			const b = this.toolBtnEls[id];
+			if (b) b.toggleClass("is-active", this.mode === id);
+		}
+		const textBtn = this.toolBtnEls["text"];
+		if (textBtn) textBtn.toggleClass("is-active", this.mode === "text");
 		this.widthPresetEls.forEach((el) =>
 			el.toggleClass("is-active", Number(el.dataset.size) === this.size)
 		);
@@ -2951,10 +2943,8 @@ class DoodleView extends ItemView {
 				return;
 			}
 			if (s.points.length !== this.inkCount) this.renderInkLayer(s);
-			this.ctx.save();
-			this.ctx.globalAlpha = s.alpha ?? 1;
+			// ink 层内 drawStroke 已应用 alpha，合成时不能再乘一次
 			this.ctx.drawImage(this.inkCanvas!, 0, 0, this.cw, this.ch);
-			this.ctx.restore();
 		});
 	}
 
@@ -3053,6 +3043,7 @@ class DoodleView extends ItemView {
 		if (s) {
 			drawStroke(this.ctx, s);
 		}
+		this.inkCount = -1;
 	}
 
 	private async saveToVault(): Promise<void> {
