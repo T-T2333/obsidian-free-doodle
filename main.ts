@@ -1501,7 +1501,12 @@ class InkOverlay {
 				const item = ev.results[i];
 				if (item.isFinal && item[0]?.transcript) txt += item[0].transcript;
 			}
-			if (txt.trim()) this.view.editor.replaceSelection(txt + " ");
+			if (!txt.trim()) return;
+			if (this.view.getMode() === "preview") {
+				new Notice("语音输入需在编辑模式（实时预览）下使用");
+				return;
+			}
+			this.view.editor.replaceSelection(txt + " ");
 		};
 		r.onerror = (ev: { error: string }) => {
 			Diag.log(`voice error: ${ev.error}`);
@@ -1633,12 +1638,16 @@ class InkOverlay {
 			};
 			this.attachAnchor(st);
 			this.undoStack.push(this.strokes.slice());
+			if (this.undoStack.length > 50) this.undoStack.shift();
 			this.redoStack.length = 0;
 			this.strokes.push(st);
 			this.redraw();
 			this.scheduleSave();
+			this.syncTool();
 		};
 		input.addEventListener("keydown", (e) => {
+			// 中文等输入法组合期的回车不提交
+			if (e.isComposing) return;
 			if (e.key === "Enter") commit();
 			else if (e.key === "Escape") this.closePopover();
 		});
@@ -1895,6 +1904,7 @@ class InkOverlay {
 	clearAllForRemove(): void {
 		this.strokes = [];
 		this.undoStack = [];
+		this.redoStack = [];
 		this.redraw();
 		this.dirty = true;
 		this.flushSave();
@@ -2066,6 +2076,13 @@ class InkOverlay {
 		this.escHandler = (e: KeyboardEvent) => {
 			const mod = e.ctrlKey || e.metaKey;
 			if (mod && e.key.toLowerCase() === "z") {
+				// 输入框/可编辑区内交给原生撤销，避免劫持文本撤销
+				const tgt = e.target as HTMLElement | null;
+				if (
+					tgt &&
+					(tgt.tagName === "INPUT" || tgt.tagName === "TEXTAREA" || tgt.isContentEditable)
+				)
+					return;
 				const active = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
 				if (active !== this.view) return;
 				e.preventDefault();
@@ -2109,7 +2126,8 @@ class InkOverlay {
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
 		this.saveTimer = window.setTimeout(() => {
 			this.saveTimer = null;
-			void this.writeNote();
+			// 已被进行中的写入/刷新落盘时跳过，避免重复写
+			if (this.dirty) void this.writeNote();
 		}, 1200);
 	}
 
@@ -2122,7 +2140,16 @@ class InkOverlay {
 		void this.writeNote();
 	}
 
+	private writing = false;
+	private pendingWrite = false;
+
 	async writeNote(): Promise<void> {
+		// 并发保护：写入进行中时排队一次补写，避免 vault.process 读改写互相覆盖
+		if (this.writing) {
+			this.pendingWrite = true;
+			return;
+		}
+		this.writing = true;
 		this.dirty = false;
 		this.placeholderCreated = false;
 		try {
@@ -2144,10 +2171,18 @@ class InkOverlay {
 			Diag.log(`writeNote 成功 ${this.file.path} strokes=${this.strokes.length}`);
 			this.scheduleRemount();
 		} catch (e) {
+			// 保存失败：恢复脏标记，等待下次操作重试
+			this.dirty = true;
 			const msg = e instanceof Error ? e.message : String(e);
 			Diag.log(`writeNote 失败: ${msg}`);
 			console.error("[free-doodle] 保存涂鸦失败", e);
 			new Notice(`涂鸦保存失败：${msg}`);
+		} finally {
+			this.writing = false;
+			if (this.pendingWrite) {
+				this.pendingWrite = false;
+				if (this.dirty) void this.writeNote();
+			}
 		}
 	}
 
@@ -3011,6 +3046,8 @@ class DoodleView extends ItemView {
 			this.syncToolbar();
 		};
 		input.addEventListener("keydown", (e) => {
+			// 中文等输入法组合期的回车不提交
+			if (e.isComposing) return;
 			if (e.key === "Enter") commit();
 			else if (e.key === "Escape") this.closePopover();
 		});
