@@ -53,8 +53,10 @@ interface Stroke {
 	alpha?: number;
 	/** 笔刷类型（自由笔迹） */
 	brush?: BrushId;
-	/** 钢笔逐点宽度（速度感应） */
+	/** 钢笔逐点宽度（速度感应，触控笔压感已折算） */
 	w?: number[];
+	/** 触控笔逐点压力 0-1（与 points 等长；仅触控笔书写时记录） */
+	pr?: number[];
 	/** 文本标注内容 */
 	text?: string;
 	/** 浓度 0-100（铅笔颗粒/马克笔叠层） */
@@ -77,6 +79,7 @@ interface StoredStroke {
 	alpha?: number;
 	brush?: BrushId;
 	w?: number[];
+	pr?: number[];
 	text?: string;
 	density?: number;
 	k?: string;
@@ -97,6 +100,7 @@ interface FreeDoodleSettings {
 	penSize: number;
 	saveFolder: string;
 	autoFit: boolean;
+	stylusPressure: boolean;
 	brushes: Record<BrushId, BrushCfg>;
 }
 
@@ -129,6 +133,7 @@ const DEFAULT_SETTINGS: FreeDoodleSettings = {
 	penSize: 4,
 	saveFolder: "涂鸦",
 	autoFit: true,
+	stylusPressure: true,
 	brushes: defaultBrushes(),
 };
 
@@ -219,6 +224,27 @@ class Diag {
 	static clear(): void {
 		Diag.entries.length = 0;
 	}
+}
+
+/**触控笔压力归一化：无压感设备/异常值回退 0.5（≈基准宽） */
+function normPress(p: number): number {
+	return Number.isFinite(p) && p > 0 ? Math.max(0.01, Math.min(1, p)) : 0.5;
+}
+
+/**压力 → 宽度系数：0.5 压力 ≈ 1.0 基准宽，范围 [0.35, 1.8] */
+function pressScale(p: number): number {
+	return Math.max(0.35, Math.min(1.8, 0.5 + (Number.isFinite(p) ? p : 0.5)));
+}
+
+/**合并同一帧内的高频指针事件（触控笔 120Hz+ 采样），无支持时回退单事件 */
+function coalescedList(evt: PointerEvent): PointerEvent[] {
+	try {
+		const list = typeof evt.getCoalescedEvents === "function" ? evt.getCoalescedEvents() : [];
+		if (list.length > 1 && list.length <= 64) return list;
+	} catch {
+		/* 某些实现可能抛错，回退即可 */
+	}
+	return [evt];
 }
 
 /**激光轨迹渲染前做一次 Chaikin 角点细分：平滑快速滑动的大转角，消除 butt 接缝缺口与透明度跳变 */
@@ -371,8 +397,18 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 				: 1;
 
 	const pts = s.points;
+	const pres =
+		!s.erase &&
+		!s.shape &&
+		!s.text &&
+		s.pr &&
+		s.pr.length === pts.length &&
+		pts.length > 1 &&
+		(brush === "pen" || brush === "pencil" || brush === "ball")
+			? s.pr
+			: null;
 
-	// 钢笔：逐段速度感应宽度
+	// 钢笔：逐段速度感应宽度（触控笔压感已在捕获期折算进 w）
 	if (brush === "pen" && !s.erase && s.w && s.w.length === pts.length && pts.length > 1) {
 		for (let i = 1; i < pts.length; i++) {
 			ctx.lineWidth = ((s.w[i - 1] + s.w[i]) / 2) * widthMul;
@@ -385,23 +421,34 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 		return;
 	}
 
-	for (let pass = 0; pass < passes; pass++) {
-		if (pass > 0) ctx.globalAlpha = (s.alpha ?? 1) * 0.4;
-		ctx.beginPath();
-		if (pts.length === 1) {
-			ctx.arc(pts[0].x, pts[0].y, Math.max(0.5, ctx.lineWidth / 2), 0, Math.PI * 2);
-			ctx.fillStyle = s.erase ? "#000" : (ctx.strokeStyle);
-			ctx.fill();
-		} else {
-			ctx.moveTo(pts[0].x, pts[0].y);
-			for (let i = 1; i < pts.length - 1; i++) {
-				const mx = (pts[i].x + pts[i + 1].x) / 2;
-				const my = (pts[i].y + pts[i + 1].y) / 2;
-				ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
-			}
-			const last = pts[pts.length - 1];
-			ctx.lineTo(last.x, last.y);
+	if (pres) {
+		// 触控笔压感：逐段变宽（仅书写类笔刷；荧光笔/马克笔保持恒宽）
+		for (let i = 1; i < pts.length; i++) {
+			ctx.lineWidth = s.size * widthMul * 0.5 * (pressScale(pres[i - 1]) + pressScale(pres[i]));
+			ctx.beginPath();
+			ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+			ctx.lineTo(pts[i].x, pts[i].y);
 			ctx.stroke();
+		}
+	} else {
+		for (let pass = 0; pass < passes; pass++) {
+			if (pass > 0) ctx.globalAlpha = (s.alpha ?? 1) * 0.4;
+			ctx.beginPath();
+			if (pts.length === 1) {
+				ctx.arc(pts[0].x, pts[0].y, Math.max(0.5, ctx.lineWidth / 2), 0, Math.PI * 2);
+				ctx.fillStyle = s.erase ? "#000" : ctx.strokeStyle;
+				ctx.fill();
+			} else {
+				ctx.moveTo(pts[0].x, pts[0].y);
+				for (let i = 1; i < pts.length - 1; i++) {
+					const mx = (pts[i].x + pts[i + 1].x) / 2;
+					const my = (pts[i].y + pts[i + 1].y) / 2;
+					ctx.quadraticCurveTo(pts[i].x, pts[i].y, mx, my);
+				}
+				const last = pts[pts.length - 1];
+				ctx.lineTo(last.x, last.y);
+				ctx.stroke();
+			}
 		}
 	}
 
@@ -642,6 +689,9 @@ function parseStrokes(data: DoodleData | null): Stroke[] {
 			alpha: typeof s.alpha === "number" ? Math.max(0.05, Math.min(1, s.alpha)) : undefined,
 			brush: (s.brush ?? "pen"),
 			w: Array.isArray(s.w) ? s.w.filter((n) => typeof n === "number" && n > 0) : undefined,
+			pr: Array.isArray(s.pr)
+				? s.pr.filter((n) => typeof n === "number" && n >= 0 && n <= 1)
+				: undefined,
 			text: typeof s.text === "string" ? s.text : undefined,
 			density: typeof s.density === "number" ? Math.max(0, Math.min(100, s.density)) : undefined,
 		}))
@@ -1486,10 +1536,20 @@ class InkOverlay {
 		return { x: evt.clientX - r.left, y: evt.clientY - r.top };
 	}
 
+	private penLastTs = 0;
+
 	private onDown = (evt: PointerEvent): void => {
 		if (!this.interactive) return;
 		const canvas = this.canvas;
-		if (!canvas || !evt.isPrimary) return;
+		if (!canvas) return;
+		const pen = evt.pointerType === "pen";
+		if (pen) {
+			this.penLastTs = performance.now();
+		} else {
+			if (!evt.isPrimary) return;
+			// 掌触拒绝：触控笔活动后 1s 内忽略触摸输入
+			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
+		}
 		this.rect = canvas.getBoundingClientRect();
 		canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
@@ -1522,6 +1582,10 @@ class InkOverlay {
 			density: cfg.density,
 			brush: bid ?? undefined,
 			w: bid === "pen" ? [Math.max(2, cfg.size)] : undefined,
+			pr:
+				pen && !erase && this.tool.mode !== "shape" && this.plugin.settings.stylusPressure
+					? [normPress(evt.pressure)]
+					: undefined,
 			points: [p],
 			shape: this.tool.mode === "shape" ? this.shapeKind : undefined,
 		};
@@ -1680,32 +1744,58 @@ class InkOverlay {
 	}
 
 	private onMove = (evt: PointerEvent): void => {
-		if (!evt.isPrimary) return;
+		const pen = evt.pointerType === "pen";
+		if (pen) {
+			this.penLastTs = performance.now();
+		} else {
+			if (!evt.isPrimary) return;
+			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
+		}
 		if (this.tool.mode === "laser") {
-			if (this.laserDown) this.pushLaser(this.toPoint(evt));
+			if (this.laserDown) {
+				for (const e of coalescedList(evt)) this.pushLaser(this.toPoint(e));
+			}
+			return;
+		}
+		// 整笔擦除拖动（需按住；悬停不误擦）
+		if (
+			!this.current &&
+			this.interactive &&
+			this.tool.mode === "eraseStroke" &&
+			(evt.buttons & 1) !== 0
+		) {
+			this.removeStrokesNear(this.toPoint(evt));
 			return;
 		}
 		const s = this.current;
 		if (!s) return;
 
-		if (!s && this.interactive && this.tool.mode === "eraseStroke") {
-			this.removeStrokesNear(this.toPoint(evt));
-			return;
-		}
-		if (!s) return;
-
+		const list = coalescedList(evt);
 		if (s.shape) {
-			s.points[1] = this.toPoint(evt);
+			s.points[1] = this.toPoint(list[list.length - 1]);
 		} else {
-			const raw = this.toPoint(evt);
-			const prev = s.points[s.points.length - 1] ?? raw;
-			const sm = emaSmooth(prev, raw, this.curCfg().stability);
-			s.points.push(sm);
-			if (s.brush === "pen" && s.w) {
-				// 速度感应宽度：越慢越粗（基于平滑后坐标）
-				const speed = Math.hypot(sm.x - prev.x, sm.y - prev.y);
-				const base = this.curCfg().size;
-				s.w.push(Math.max(base * 0.45, Math.min(base * 1.5, base * (1.45 - speed * 0.03))));
+			for (const e of list) {
+				const raw = this.toPoint(e);
+				const prev = s.points[s.points.length - 1] ?? raw;
+				const sm = emaSmooth(prev, raw, this.curCfg().stability);
+				s.points.push(sm);
+				if (s.pr) s.pr.push(normPress(e.pressure));
+				if (s.brush === "pen" && s.w) {
+					// 速度感应宽度：越慢越粗（基于平滑后坐标）；触控笔再叠压感
+					const speed = Math.hypot(sm.x - prev.x, sm.y - prev.y);
+					const base = this.curCfg().size;
+					let wv = Math.max(
+						base * 0.45,
+						Math.min(base * 1.5, base * (1.45 - speed * 0.03))
+					);
+					if (s.pr) {
+						wv = Math.max(
+							base * 0.2,
+							Math.min(base * 2.2, wv * pressScale(s.pr[s.pr.length - 1]))
+						);
+					}
+					s.w.push(wv);
+				}
 			}
 		}
 		this.schedulePreview();
@@ -2105,6 +2195,10 @@ class InkOverlay {
 				alpha: s.alpha,
 				brush: s.brush,
 				w: s.w,
+				pr:
+					s.pr && s.pr.length === s.points.length
+						? s.pr.map((n) => Math.round(n * 100) / 100)
+						: undefined,
 				text: s.text,
 				density: s.density,
 			})),
@@ -2802,8 +2896,17 @@ class DoodleView extends ItemView {
 		return { x: evt.clientX - r.left, y: evt.clientY - r.top };
 	}
 
+	private penLastTs = 0;
+
 	private onDown(evt: PointerEvent): void {
-		if (!evt.isPrimary) return;
+		const pen = evt.pointerType === "pen";
+		if (pen) {
+			this.penLastTs = performance.now();
+		} else {
+			if (!evt.isPrimary) return;
+			// 掌触拒绝：触控笔活动后 1s 内忽略触摸输入
+			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
+		}
 		this.rect = this.canvas.getBoundingClientRect();
 		this.canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
@@ -2836,6 +2939,10 @@ class DoodleView extends ItemView {
 			density: cfg.density,
 			brush: bid ?? undefined,
 			w: bid === "pen" ? [Math.max(2, cfg.size)] : undefined,
+			pr:
+				pen && !erase && this.mode !== "shape" && this.plugin.settings.stylusPressure
+					? [normPress(evt.pressure)]
+					: undefined,
 			points: [p],
 			shape: this.mode === "shape" ? this.shapeKind : undefined,
 		};
@@ -2979,29 +3086,51 @@ class DoodleView extends ItemView {
 	}
 
 	private onMove(evt: PointerEvent): void {
-		if (!evt.isPrimary) return;
+		const pen = evt.pointerType === "pen";
+		if (pen) {
+			this.penLastTs = performance.now();
+		} else {
+			if (!evt.isPrimary) return;
+			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
+		}
 		if (this.mode === "laser") {
-			if (this.laserDown) this.pushLaser(this.toPoint(evt));
+			if (this.laserDown) {
+				for (const e of coalescedList(evt)) this.pushLaser(this.toPoint(e));
+			}
 			return;
 		}
-		const s = this.current;
-
-		if (!s && this.mode === "eraseStroke") {
+		// 整笔擦除拖动（需按住；悬停不误擦）
+		if (!this.current && this.mode === "eraseStroke" && (evt.buttons & 1) !== 0) {
 			this.removeStrokesNear(this.toPoint(evt));
 			return;
 		}
+		const s = this.current;
 		if (!s) return;
 
+		const list = coalescedList(evt);
 		if (s.shape) {
-			s.points[1] = this.toPoint(evt);
+			s.points[1] = this.toPoint(list[list.length - 1]);
 		} else {
-			const prev = s.points[s.points.length - 1];
-			const cur = this.toPoint(evt);
-			s.points.push(cur);
-			if (s.brush === "pen" && s.w) {
-				const speed = Math.hypot(cur.x - prev.x, cur.y - prev.y);
-				const base = this.curCfg().size;
-				s.w.push(Math.max(base * 0.45, Math.min(base * 1.5, base * (1.45 - speed * 0.03))));
+			for (const e of list) {
+				const prev = s.points[s.points.length - 1];
+				const cur = this.toPoint(e);
+				s.points.push(cur);
+				if (s.pr) s.pr.push(normPress(e.pressure));
+				if (s.brush === "pen" && s.w) {
+					const speed = Math.hypot(cur.x - prev.x, cur.y - prev.y);
+					const base = this.curCfg().size;
+					let wv = Math.max(
+						base * 0.45,
+						Math.min(base * 1.5, base * (1.45 - speed * 0.03))
+					);
+					if (s.pr) {
+						wv = Math.max(
+							base * 0.2,
+							Math.min(base * 2.2, wv * pressScale(s.pr[s.pr.length - 1]))
+						);
+					}
+					s.w.push(wv);
+				}
 			}
 		}
 		this.schedulePreview();
@@ -3541,6 +3670,15 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 					control: {
 						type: "toggle",
 						key: "autoFit",
+						defaultValue: true,
+					},
+				},
+				{
+					name: "Stylus pressure 触控笔压感",
+					desc: "Pen/pencil/ball width follows stylus pressure (tablet). 钢笔/铅笔/圆珠笔按触控笔压力变化粗细。",
+					control: {
+						type: "toggle",
+						key: "stylusPressure",
 						defaultValue: true,
 					},
 				},

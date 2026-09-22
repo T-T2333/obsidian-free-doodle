@@ -30,6 +30,10 @@
 	pointer-events: auto;
 	touch-action: none;
 	cursor: crosshair;
+	/* 平板：禁用长按系统菜单与文本选择，触控笔书写不被干扰 */
+	-webkit-touch-callout: none;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
 .free-doodle-board {
@@ -39,6 +43,9 @@
 	pointer-events: auto;
 	touch-action: none;
 	cursor: crosshair;
+	-webkit-touch-callout: none;
+	-webkit-user-select: none;
+	user-select: none;
 }
 
 .free-doodle-floatbar {
