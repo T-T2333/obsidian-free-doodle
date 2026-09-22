@@ -569,7 +569,7 @@ function fitFreehand(s: Stroke): Stroke | null {
 			const B = { ...s.points[s.points.length - 1] };
 			if (Math.abs(B.y - A.y) <= diag * 0.07) B.y = A.y;
 			else if (Math.abs(B.x - A.x) <= diag * 0.07) B.x = A.x;
-			return { ...s, shape: "line", points: [A, B] };
+			return { ...s, shape: "line", points: [A, B], w: undefined, pr: undefined };
 		}
 		return null;
 	}
@@ -578,8 +578,8 @@ function fitFreehand(s: Stroke): Stroke | null {
 	const tl = { x: x0, y: y0 };
 	const br = { x: x1, y: y1 };
 	if (corners >= 3 && corners <= 6)
-		return { ...s, shape: "rect", points: [tl, br] };
-	return { ...s, shape: "ellipse", points: [tl, br] };
+		return { ...s, shape: "rect", points: [tl, br], w: undefined, pr: undefined };
+	return { ...s, shape: "ellipse", points: [tl, br], w: undefined, pr: undefined };
 }
 
 /* ---------- 形状几何：轮廓采样 / 命中测试 ---------- */
@@ -1088,6 +1088,7 @@ class InkOverlay {
 			const fitted = fitFreehand(s);
 			if (!fitted) continue;
 			this.undoStack.push(this.strokes.slice());
+			if (this.undoStack.length > 50) this.undoStack.shift();
 			this.redoStack.length = 0;
 			this.strokes[i] = fitted;
 			this.syncTool();
@@ -1537,6 +1538,8 @@ class InkOverlay {
 	}
 
 	private penLastTs = 0;
+	private activePointerId: number | null = null;
+	private activePointerType: string | null = null;
 
 	private onDown = (evt: PointerEvent): void => {
 		if (!this.interactive) return;
@@ -1544,12 +1547,17 @@ class InkOverlay {
 		if (!canvas) return;
 		const pen = evt.pointerType === "pen";
 		if (pen) {
+			// 已有非触摸指针在画时，忽略第二支笔/次要指针（允许笔接管触摸/手掌的笔迹）
+			if (!evt.isPrimary && (this.current || this.laserDown) && this.activePointerType !== "touch")
+				return;
 			this.penLastTs = performance.now();
 		} else {
 			if (!evt.isPrimary) return;
 			// 掌触拒绝：触控笔活动后 1s 内忽略触摸输入
 			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
 		}
+		this.activePointerId = evt.pointerId;
+		this.activePointerType = evt.pointerType;
 		this.rect = canvas.getBoundingClientRect();
 		canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
@@ -1566,7 +1574,7 @@ class InkOverlay {
 
 		if (this.tool.mode === "eraseStroke") {
 			this.strokeEraseUndoArmed = true;
-			this.removeStrokesNear(p);
+			if (this.removeStrokesNear(p) > 0) this.syncTool();
 			return;
 		}
 
@@ -1646,7 +1654,7 @@ class InkOverlay {
 	private laserRunning = false;
 	private laserDown = false;
 
-	private removeStrokesNear(p: Point): number {
+	private removeStrokesNear(p: Point, deferRedraw = false): number {
 		const entries = this.getCandidateEntries();
 		let removed = 0;
 		for (let i = this.strokes.length - 1; i >= 0; i--) {
@@ -1683,7 +1691,7 @@ class InkOverlay {
 			if (hit) {
 				if (this.strokeEraseUndoArmed) {
 					this.undoStack.push(this.strokes.slice());
-		this.redoStack.length = 0;
+					this.redoStack.length = 0;
 					if (this.undoStack.length > 50) this.undoStack.shift();
 					this.strokeEraseUndoArmed = false;
 				}
@@ -1691,7 +1699,7 @@ class InkOverlay {
 				removed++;
 			}
 		}
-		if (removed > 0) {
+		if (removed > 0 && !deferRedraw) {
 			this.redraw();
 			this.scheduleSave();
 		}
@@ -1757,14 +1765,22 @@ class InkOverlay {
 			}
 			return;
 		}
-		// 整笔擦除拖动（需按住；悬停不误擦）
+		// 整笔擦除拖动（需按住；悬停不误擦；合并采样防止快速拖动漏擦）
 		if (
 			!this.current &&
 			this.interactive &&
 			this.tool.mode === "eraseStroke" &&
 			(evt.buttons & 1) !== 0
 		) {
-			this.removeStrokesNear(this.toPoint(evt));
+			let any = false;
+			for (const e of coalescedList(evt)) {
+				if (this.removeStrokesNear(this.toPoint(e), true) > 0) any = true;
+			}
+			if (any) {
+				this.redraw();
+				this.scheduleSave();
+				this.syncTool();
+			}
 			return;
 		}
 		const s = this.current;
@@ -1801,18 +1817,25 @@ class InkOverlay {
 		this.schedulePreview();
 	};
 
-	private onUp = (): void => {
+	private onUp = (evt?: PointerEvent): void => {
+		// 仅响应本次捕获指针的抬起/取消，避免其它指针提前提交
+		if (evt && evt.pointerId !== this.activePointerId) return;
+		this.activePointerId = null;
+		this.activePointerType = null;
 		this.laserDown = false;
 		if (this.tool.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
 		if (!s) return;
 		this.current = null;
 
-		// 形状拖动距离过小则丢弃
+		// 形状拖动距离过小则丢弃（重绘清除预览残影）
 		if (s.shape && s.points.length >= 2) {
 			const a = s.points[0];
 			const b = s.points[s.points.length - 1];
-			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
+			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) {
+				this.redraw();
+				return;
+			}
 		}
 
 		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
@@ -1832,9 +1855,9 @@ class InkOverlay {
 		this.syncTool();
 	};
 
-	private onCancel = (): void => {
-		this.laserDown = false;
-		this.current = null;
+	// pointercancel（掌触/手势打断）提交半截笔迹而不是整笔丢弃
+	private onCancel = (evt?: PointerEvent): void => {
+		this.onUp(evt);
 	};
 
 	private redoStack: Stroke[][] = [];
@@ -2194,7 +2217,7 @@ class InkOverlay {
 				shape: s.shape,
 				alpha: s.alpha,
 				brush: s.brush,
-				w: s.w,
+				w: s.w && s.w.length === s.points.length ? s.w : undefined,
 				pr:
 					s.pr && s.pr.length === s.points.length
 						? s.pr.map((n) => Math.round(n * 100) / 100)
@@ -2425,11 +2448,9 @@ class DoodleView extends ItemView {
 		this.registerDomEvent(this.canvas, "pointermove", (evt: PointerEvent) =>
 			this.onMove(evt)
 		);
-		this.registerDomEvent(this.canvas, "pointerup", () => this.onUp());
-		this.registerDomEvent(this.canvas, "pointercancel", () => {
-			this.laserDown = false;
-			this.current = null;
-		});
+		this.registerDomEvent(this.canvas, "pointerup", (evt: PointerEvent) => this.onUp(evt));
+		// pointercancel（掌触/手势打断）提交半截笔迹而不是整笔丢弃
+		this.registerDomEvent(this.canvas, "pointercancel", (evt: PointerEvent) => this.onUp(evt));
 		this.registerDomEvent(this.canvas, "contextmenu", (evt: MouseEvent) =>
 			evt.preventDefault()
 		);
@@ -2889,6 +2910,7 @@ class DoodleView extends ItemView {
 		this.pushUndo();
 		this.strokes = [];
 		this.redraw();
+		this.syncToolbar();
 	}
 
 	private toPoint(evt: PointerEvent): Point {
@@ -2897,16 +2919,23 @@ class DoodleView extends ItemView {
 	}
 
 	private penLastTs = 0;
+	private activePointerId: number | null = null;
+	private activePointerType: string | null = null;
 
 	private onDown(evt: PointerEvent): void {
 		const pen = evt.pointerType === "pen";
 		if (pen) {
+			// 已有非触摸指针在画时，忽略第二支笔/次要指针（允许笔接管触摸/手掌的笔迹）
+			if (!evt.isPrimary && (this.current || this.laserDown) && this.activePointerType !== "touch")
+				return;
 			this.penLastTs = performance.now();
 		} else {
 			if (!evt.isPrimary) return;
 			// 掌触拒绝：触控笔活动后 1s 内忽略触摸输入
 			if (evt.pointerType === "touch" && performance.now() - this.penLastTs < 1000) return;
 		}
+		this.activePointerId = evt.pointerId;
+		this.activePointerType = evt.pointerType;
 		this.rect = this.canvas.getBoundingClientRect();
 		this.canvas.setPointerCapture(evt.pointerId);
 		const p = this.toPoint(evt);
@@ -2923,7 +2952,7 @@ class DoodleView extends ItemView {
 
 		if (this.mode === "eraseStroke") {
 			this.strokeEraseUndoArmed = true;
-			this.removeStrokesNear(p);
+			if (this.removeStrokesNear(p) > 0) this.syncToolbar();
 			return;
 		}
 
@@ -2997,7 +3026,7 @@ class DoodleView extends ItemView {
 	private laserRunning = false;
 	private laserDown = false;
 
-	private removeStrokesNear(p: Point): void {
+	private removeStrokesNear(p: Point, deferRedraw = false): number {
 		let removed = 0;
 		for (let i = this.strokes.length - 1; i >= 0; i--) {
 			const s = this.strokes[i];
@@ -3036,9 +3065,10 @@ class DoodleView extends ItemView {
 				removed++;
 			}
 		}
-		if (removed > 0) {
+		if (removed > 0 && !deferRedraw) {
 			this.redraw();
 		}
+		return removed;
 	}
 
 	private inkCanvas: HTMLCanvasElement | null = null;
@@ -3099,9 +3129,16 @@ class DoodleView extends ItemView {
 			}
 			return;
 		}
-		// 整笔擦除拖动（需按住；悬停不误擦）
+		// 整笔擦除拖动（需按住；悬停不误擦；合并采样防止快速拖动漏擦）
 		if (!this.current && this.mode === "eraseStroke" && (evt.buttons & 1) !== 0) {
-			this.removeStrokesNear(this.toPoint(evt));
+			let any = false;
+			for (const e of coalescedList(evt)) {
+				if (this.removeStrokesNear(this.toPoint(e), true) > 0) any = true;
+			}
+			if (any) {
+				this.redraw();
+				this.syncToolbar();
+			}
 			return;
 		}
 		const s = this.current;
@@ -3136,7 +3173,11 @@ class DoodleView extends ItemView {
 		this.schedulePreview();
 	}
 
-	private onUp(): void {
+	private onUp(evt?: PointerEvent): void {
+		// 仅响应本次捕获指针的抬起/取消，避免其它指针提前提交
+		if (evt && evt.pointerId !== this.activePointerId) return;
+		this.activePointerId = null;
+		this.activePointerType = null;
 		this.laserDown = false;
 		if (this.mode === "laser") return; // 淡出由激光循环处理
 		const s = this.current;
@@ -3146,7 +3187,10 @@ class DoodleView extends ItemView {
 		if (s.shape && s.points.length >= 2) {
 			const a = s.points[0];
 			const b = s.points[s.points.length - 1];
-			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) return;
+			if (Math.abs(b.x - a.x) < 4 && Math.abs(b.y - a.y) < 4) {
+				this.redraw();
+				return;
+			}
 		}
 
 		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
@@ -3159,6 +3203,7 @@ class DoodleView extends ItemView {
 		this.pushUndo();
 		this.strokes.push(final);
 		this.redraw();
+		this.syncToolbar();
 	}
 
 	private baseCanvas: HTMLCanvasElement | null = null;
