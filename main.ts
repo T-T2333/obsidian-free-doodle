@@ -829,6 +829,12 @@ class InkOverlay {
 		}
 		if (this.timer !== null) window.clearInterval(this.timer);
 		if (this.saveTimer !== null) window.clearTimeout(this.saveTimer);
+		// 设置防抖未落盘时立即保存，避免 350ms 内卸载丢失笔刷/样式修改
+		if (this.cfgSaveT !== null) {
+			window.clearTimeout(this.cfgSaveT);
+			this.cfgSaveT = null;
+			void this.plugin.saveSettings();
+		}
 		this.removeEscListener();
 		this.unmount();
 		if (save && this.dirty) void this.writeNote();
@@ -1288,6 +1294,8 @@ class InkOverlay {
 			sizeSlider.addEventListener("input", () => {
 				cfg.size = Number(sizeSlider.value);
 				sizeVal.setText(`${cfg.size} px`);
+				// penSize 是钢笔粗细的兼容镜像，保持同步
+				if (bid === "pen") this.plugin.settings.penSize = cfg.size;
 				this.syncTool();
 				this.queueSaveSettings();
 			});
@@ -1418,11 +1426,16 @@ class InkOverlay {
 
 	private setMode(mode: ToolMode): void {
 		this.tool.mode = mode;
-		// 切到荧光笔时若不透明度过高，自动降为典型荧光笔透明度
-		if (mode === "hl" && this.tool.opacity > 0.6) {
-			this.tool.opacity = 0.35;
-			if (this.opacitySliderEl) {
-				this.opacitySliderEl.value = String(Math.round(this.tool.opacity * 100));
+		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明度
+		// （笔迹 alpha 取自 curCfg().opacity，必须改笔刷配置而非 tool.opacity）
+		if (mode === "hl") {
+			const cfg = this.curCfg();
+			if (cfg.opacity > 0.6) {
+				cfg.opacity = 0.35;
+				this.tool.opacity = 0.35;
+				if (this.opacitySliderEl)
+					this.opacitySliderEl.value = String(Math.round(0.35 * 100));
+				this.queueSaveSettings();
 			}
 		}
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
@@ -2674,10 +2687,10 @@ class DoodleView extends ItemView {
 		const textBtn = this.toolBtnEls["text"];
 		if (textBtn) textBtn.toggleClass("is-active", this.mode === "text");
 		this.widthPresetEls.forEach((el) =>
-			el.toggleClass("is-active", Number(el.dataset.size) === this.size)
+			el.toggleClass("is-active", Number(el.dataset.size) === this.curCfg().size)
 		);
 		if (this.colorInputEl) this.colorInputEl.value = this.color;
-		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.size);
+		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.curCfg().size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		const undoBtn2 = this.toolBtnEls["undo"] as HTMLButtonElement | undefined;
 		if (undoBtn2) undoBtn2.disabled = this.undoStack.length === 0;
@@ -2737,6 +2750,9 @@ class DoodleView extends ItemView {
 			el.addClass("free-doodle-style-pop");
 			this.swatchEls = [];
 			this.widthPresetEls = [];
+			// 粗细/不透明度实际作用于 curCfg()（笔迹 alpha/size 来源），打开时从配置初始化
+			this.size = this.curCfg().size;
+			this.opacity = this.curCfg().opacity;
 			const colors = el.createDiv({ cls: "free-doodle-pop-row" });
 			for (const c of PALETTE) {
 				const b = colors.createEl("button", {
@@ -2777,12 +2793,17 @@ class DoodleView extends ItemView {
 					cls: "free-doodle-btn free-doodle-wpreset",
 					text: label,
 				});
-				b.dataset.size = String(val);
-				b.addEventListener("click", () => {
-					this.size = val;
-					this.syncToolbar();
-				});
-				this.widthPresetEls.push(b);
+			b.dataset.size = String(val);
+			b.addEventListener("click", () => {
+				// 必须写入笔刷配置：OnDown 的 size 取自 curCfg().size
+				const cfg = this.curCfg();
+				cfg.size = val;
+				this.size = val;
+				if (this.curBrushId() === "pen") this.plugin.settings.penSize = val;
+				this.syncToolbar();
+				void this.plugin.saveSettings();
+			});
+			this.widthPresetEls.push(b);
 			}
 
 			const opRow = el.createDiv({ cls: "free-doodle-pop-row" });
@@ -2799,7 +2820,12 @@ class DoodleView extends ItemView {
 			});
 			this.opacitySliderEl.addEventListener("input", () => {
 				this.opacity = Number(this.opacitySliderEl.value) / 100;
+				// 笔迹 alpha 取自 curCfg().opacity，必须同步写入笔刷配置
+				this.curCfg().opacity = this.opacity;
 				this.opacityLabelEl.setText(`${this.opacitySliderEl.value}%`);
+			});
+			this.opacitySliderEl.addEventListener("change", () => {
+				void this.plugin.saveSettings();
 			});
 
 			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
@@ -2877,11 +2903,17 @@ class DoodleView extends ItemView {
 
 	private setBoardMode(mode: BoardTool): void {
 		this.mode = mode;
-		if (mode === "hl" && this.opacity > 0.6) {
-			this.opacity = 0.35;
-			if (this.opacitySliderEl)
-				this.opacitySliderEl.value = String(Math.round(this.opacity * 100));
-			if (this.opacityLabelEl) this.opacityLabelEl.setText(`${Math.round(this.opacity * 100)}%`);
+		// 荧光笔透明度同样写入笔刷配置（笔迹 alpha 来源）
+		if (mode === "hl") {
+			const cfg = this.curCfg();
+			if (cfg.opacity > 0.6) {
+				cfg.opacity = 0.35;
+				this.opacity = 0.35;
+				if (this.opacitySliderEl)
+					this.opacitySliderEl.value = String(Math.round(0.35 * 100));
+				if (this.opacityLabelEl) this.opacityLabelEl.setText("35%");
+				void this.plugin.saveSettings();
+			}
 		}
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
 		this.canvas.setCssStyles({
@@ -3290,10 +3322,14 @@ class DoodleView extends ItemView {
 	private async saveToVault(): Promise<void> {
 		try {
 			const folder = normalizePath(this.plugin.settings.saveFolder);
-			const adapter = this.app.vault.adapter;
-			if (!(await adapter.exists(folder))) {
+		const adapter = this.app.vault.adapter;
+		if (!(await adapter.exists(folder))) {
+			try {
 				await this.app.vault.createFolder(folder);
+			} catch {
+				/* 并发创建竞态（已存在）时忽略 */
 			}
+		}
 			const d = new Date();
 			const pad = (n: number) => String(n).padStart(2, "0");
 			const base =
@@ -3322,13 +3358,14 @@ class DoodleView extends ItemView {
 				/* 剪贴板不可用时忽略 */
 			}
 
-			const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
-			if (mdView) {
-				mdView.editor.replaceSelection(`![[${file.name}]]`);
-				new Notice(`已保存并插入：${file.path}`);
-			} else {
-				new Notice(`已保存：${file.path}（图片已复制到剪贴板，可粘贴进笔记）`);
-			}
+		const mdView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		// 阅读模式下 editor 不可见，跳过插入，仅提示路径
+		if (mdView && mdView.getMode() !== "preview") {
+			mdView.editor.replaceSelection(`![[${file.name}]]`);
+			new Notice(`已保存并插入：${file.path}`);
+		} else {
+			new Notice(`已保存：${file.path}（图片已复制到剪贴板，可粘贴进笔记）`);
+		}
 		} catch (e) {
 			console.error("[free-doodle] 保存失败", e);
 			new Notice(`保存失败：${e instanceof Error ? e.message : String(e)}`);
@@ -3455,6 +3492,8 @@ export default class FreeDoodlePlugin extends Plugin {
 			const o = bStored[id];
 			if (o) this.settings.brushes[id] = { ...defaultBrushes()[id], ...o };
 		}
+		// penSize 为兼容镜像字段：以实际生效的钢笔笔刷粗细为准（历史版本该字段不生效）
+		this.settings.penSize = this.settings.brushes.pen.size;
 		if (typeof this.settings.autoFit !== "boolean") this.settings.autoFit = true;
 	}
 
@@ -3472,9 +3511,10 @@ export default class FreeDoodlePlugin extends Plugin {
 			let ov = this.overlays.get(view);
 			// 视图被复用加载了别的文件：旧覆盖层作废
 			if (ov && ov.file !== view.file) {
-				Diag.log(`sweep: 视图复用，销毁旧覆盖层 ${ov.file.path}`);
-				ov.destroy(false);
-				this.overlays.delete(view);
+					Diag.log(`sweep: 视图复用，销毁旧覆盖层 ${ov.file.path}`);
+					// 视图已切到别的文件：仍需把旧文件未保存的墨迹落盘
+					ov.destroy(true);
+					this.overlays.delete(view);
 				if (this.activePath === ov.file.path) this.activePath = null;
 				ov = undefined;
 			}
@@ -3505,7 +3545,8 @@ export default class FreeDoodlePlugin extends Plugin {
 	dropOverlay(overlay: InkOverlay): void {
 		for (const [view, ov] of Array.from(this.overlays.entries())) {
 			if (ov === overlay) {
-				ov.destroy(false);
+				// 文件切换导致的作废：保存未落盘的墨迹，避免丢笔
+				ov.destroy(true);
 				this.overlays.delete(view);
 			}
 		}
@@ -3645,12 +3686,14 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 			.addSlider((sb) =>
 				sb
 					.setLimits(1, 40, 1)
-					.setValue(this.plugin.settings.penSize)
-					.onChange(async (v) => {
-						this.plugin.settings.penSize = v;
-						await this.plugin.saveSettings();
-					})
-			);
+			.setValue(this.plugin.settings.penSize)
+			.onChange(async (v) => {
+				this.plugin.settings.penSize = v;
+				// 实际笔迹粗细取自 brushes.pen.size，保持镜像同步
+				this.plugin.settings.brushes.pen.size = v;
+				await this.plugin.saveSettings();
+			})
+		);
 
 		new Setting(containerEl)
 			.setName("自动拟合图形")
@@ -3702,6 +3745,10 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 			value = value.trim() || DEFAULT_SETTINGS.saveFolder;
 		}
 		settings[key] = value;
+		// penSize 是钢笔粗细兼容字段，同步到实际生效的笔刷配置
+		if (key === "penSize" && typeof value === "number") {
+			this.plugin.settings.brushes.pen.size = Math.max(1, Math.min(40, Math.round(value)));
+		}
 		void this.plugin.saveSettings();
 	}
 
