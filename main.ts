@@ -269,6 +269,9 @@ class HandwritingEngine {
 	private preCtx: CanvasRenderingContext2D | null = null;
 	private floatBuf: Float32Array | null = null;
 	private hanziReady = false;
+	private disposed = false;
+	private recognitionQueue: Promise<void> = Promise.resolve();
+	private activeRecognitions = 0;
 
 	constructor(private plugin: FreeDoodlePlugin) {}
 
@@ -283,6 +286,7 @@ class HandwritingEngine {
 	}
 
 	async ensureReady(): Promise<void> {
+		if (this.disposed) throw new Error("手写识别引擎已释放");
 		if (this.ready) return;
 		if (this.loading) return this.loading;
 		this.loading = this.load();
@@ -294,15 +298,20 @@ class HandwritingEngine {
 	}
 
 	private async load(): Promise<void> {
+		if (this.disposed) return;
 		try {
 			await this.loadPpocr();
+			if (this.disposed) return;
 			this.backend = "ppocr";
 			this.ready = true;
 			return;
 		} catch (e) {
+			if (this.disposed) return;
 			Diag.log(`PP-OCR 加载失败，回退 HanziLookup: ${String(e)}`);
 		}
+		if (this.disposed) return;
 		await this.loadHanzi();
+		if (this.disposed) return;
 		this.backend = "hanzi";
 		this.ready = true;
 	}
@@ -325,6 +334,7 @@ class HandwritingEngine {
 		try {
 			for (const asset of HW_ASSETS) {
 				await this.ensureAsset(asset);
+				if (this.disposed) return;
 			}
 		} finally {
 			notice?.hide();
@@ -340,10 +350,14 @@ class HandwritingEngine {
 
 		const modelBuf = await adapter.readBinary(this.pluginFile(PPOCR_MODEL_FILE));
 		const wasmBuf = await adapter.readBinary(this.pluginFile(ORT_WASM_FILE));
+		if (!WebAssembly.validate(wasmBuf)) {
+			throw new Error("推理运行时无效");
+		}
 		const mjsText = await adapter.read(this.pluginFile(ORT_MJS_FILE));
 		if (mjsText.length < 1000 || !mjsText.includes("ortWasm")) {
 			throw new Error("推理加载器内容无效");
 		}
+		if (this.disposed) return;
 
 		if (this.mjsBlobUrl) URL.revokeObjectURL(this.mjsBlobUrl);
 		this.mjsBlobUrl = URL.createObjectURL(new Blob([mjsText], { type: "text/javascript" }));
@@ -353,12 +367,21 @@ class HandwritingEngine {
 		ort.env.wasm.wasmBinary = wasmBuf;
 		ort.env.wasm.wasmPaths = { mjs: this.mjsBlobUrl };
 
-		this.session = await ort.InferenceSession.create(modelBuf, {
+		const session = await ort.InferenceSession.create(modelBuf, {
 			executionProviders: ["wasm"],
 		});
+		if (this.disposed) {
+			this.releaseSession(session);
+			return;
+		}
+		this.session = session;
 		Diag.log(
-			`PP-OCR 就绪 backend=ppocr dict=${this.dictionary.length} inputs=${this.session.inputNames.join(",")}`
+			`PP-OCR 就绪 backend=ppocr dict=${this.dictionary.length} inputs=${session.inputNames.join(",")}`
 		);
+	}
+
+	private releaseSession(session: ort.InferenceSession): void {
+		void session.release().catch((e) => Diag.log(`手写识别会话释放失败: ${String(e)}`));
 	}
 
 	private async ensureAsset(asset: HwAsset): Promise<void> {
@@ -446,6 +469,7 @@ class HandwritingEngine {
 		if (!Array.isArray(json.chars) || typeof json.substrokes !== "string") {
 			throw new Error("识别数据格式无效，请删除插件目录内 hanzi-mmah.json 后重试");
 		}
+		if (this.disposed) return;
 		const HL = getHanziLookup();
 		if (!HL) throw new Error("识别引擎未加载（请重新启用插件）");
 		HL.data["mmah"] = {
@@ -457,6 +481,8 @@ class HandwritingEngine {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		const session = this.session;
 		this.session = null;
 		this.dictionary = [];
 		if (this.mjsBlobUrl) {
@@ -469,11 +495,21 @@ class HandwritingEngine {
 		this.ready = false;
 		this.backend = null;
 		this.hanziReady = false;
+		if (session && this.activeRecognitions === 0) this.releaseSession(session);
 	}
 
 	recognize(strokes: number[][][], limit = 6): Promise<HanziMatch[]> {
-		if (this.backend === "ppocr") return this.recognizePpocr(strokes, limit);
-		return this.recognizeHanzi(strokes, limit);
+		const result = this.recognitionQueue.then(() => {
+			if (this.disposed) throw new Error("手写识别引擎已释放");
+			if (this.backend === "ppocr") return this.recognizePpocr(strokes, limit);
+			if (this.backend === "hanzi") return this.recognizeHanzi(strokes, limit);
+			throw new Error("手写识别引擎尚未就绪");
+		});
+		this.recognitionQueue = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
 	}
 
 	/** 清洗点列：丢弃非有限坐标与空笔（单点以圆点形式保留在渲染阶段） */
@@ -647,31 +683,39 @@ class HandwritingEngine {
 	private async recognizePpocr(strokes: number[][][], limit: number): Promise<HanziMatch[]> {
 		const session = this.session;
 		if (!session) return Promise.reject(new Error("PP-OCR 会话未就绪"));
-		const cleaned = this.cleanStrokes(strokes);
-		if (!cleaned.length) return [];
-		const ink = this.renderInk(cleaned);
-		if (!ink) return [];
-		const data = this.preprocess(ink);
-		if (!data) return [];
-		const inputName = session.inputNames[0];
-		if (!inputName) return [];
-		const tensor = new ort.Tensor("float32", data, [1, 3, 48, 128]);
+		this.activeRecognitions++;
 		try {
-			const results = await session.run({ [inputName]: tensor });
-			const outName = session.outputNames[0];
-			const output = outName ? results[outName] : undefined;
-			if (!output) return [];
-			const matches = this.postprocess(
-				output.data as Float32Array,
-				output.dims,
-				limit
-			);
-			for (const key of Object.keys(results)) {
-				results[key]?.dispose();
+			const cleaned = this.cleanStrokes(strokes);
+			if (!cleaned.length) return [];
+			const ink = this.renderInk(cleaned);
+			if (!ink) return [];
+			const data = this.preprocess(ink);
+			if (!data) return [];
+			const inputName = session.inputNames[0];
+			if (!inputName) return [];
+			const tensor = new ort.Tensor("float32", data, [1, 3, 48, 128]);
+			try {
+				const results = await session.run({ [inputName]: tensor });
+				try {
+					const outName = session.outputNames[0];
+					const output = outName ? results[outName] : undefined;
+					if (!output) return [];
+					return this.postprocess(
+						output.data as Float32Array,
+						output.dims,
+						limit
+					);
+				} finally {
+					for (const key of Object.keys(results)) {
+						results[key]?.dispose();
+					}
+				}
+			} finally {
+				tensor.dispose();
 			}
-			return matches;
 		} finally {
-			tensor.dispose();
+			this.activeRecognitions--;
+			if (this.disposed && this.activeRecognitions === 0) this.releaseSession(session);
 		}
 	}
 
@@ -2614,7 +2658,8 @@ class InkOverlay {
 		}
 		// 识别前剔除已被撤销/擦除的笔画
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
-		if (!this.hwBatch.length) {
+		const batch = this.hwBatch.slice();
+		if (!batch.length) {
 			if (!auto) new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
@@ -2623,10 +2668,15 @@ class InkOverlay {
 		const notice = new Notice("手写识别：加载数据…", 0);
 		try {
 			await this.plugin.hwEngine.ensureReady();
+			if (!this.isHwBatchCurrent(batch)) return;
 			notice.setMessage("手写识别：识别中…");
-			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			const pts = batch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			if (!this.isHwBatchCurrent(batch)) {
+				Diag.log("手写识别结果已丢弃：批次已被撤销或清除");
+				return;
+			}
 			const top = cands[0];
 			Diag.log(
 				`手写识别结果 n=${cands.length} backend=${this.plugin.hwEngine.backendName} ` +
@@ -2640,14 +2690,14 @@ class InkOverlay {
 			}
 			if (auto) {
 				if (top && top.score >= HW_AUTO_MIN_SCORE) {
-					this.applyHwCandidate(top.character);
+					this.applyHwCandidate(top.character, batch);
 				} else {
 					// 低置信：不盲替换，弹出候选
 					Diag.log(`自动替换跳过 score=${top ? top.score.toFixed(3) : "-"} < ${HW_AUTO_MIN_SCORE}`);
-					this.showHwCandidates(cands);
+					this.showHwCandidates(cands, batch);
 				}
 			} else {
-				this.showHwCandidates(cands);
+				this.showHwCandidates(cands, batch);
 			}
 		} catch (e) {
 			Diag.log(`手写识别失败: ${String(e)}`);
@@ -2659,22 +2709,26 @@ class InkOverlay {
 		}
 	}
 
-	private showHwCandidates(cands: HanziMatch[]): void {
+	private isHwBatchCurrent(batch: Stroke[]): boolean {
+		return batch.every((s) => this.hwBatch.includes(s) && this.strokes.includes(s));
+	}
+
+	private showHwCandidates(cands: HanziMatch[], batch: Stroke[]): void {
+		if (!this.isHwBatchCurrent(batch)) return;
 		const host = this.view.contentEl;
 		this.closePopover();
 		const pop = buildHwCandidatePopover(
 			host,
 			cands,
-			(ch) => this.applyHwCandidate(ch),
+			(ch) => this.applyHwCandidate(ch, batch),
 			() => {
-				this.hwBatch = [];
+				this.hwBatch = this.hwBatch.filter((s) => !batch.includes(s));
 				this.closePopover();
 				this.syncTool();
 			}
 		);
 		this.popover = pop;
-		// contentEl 为定位上下文；用 contentEl 与 canvas 的相对偏移换算，避免跑出视口
-		const bb = strokesBBox(this.hwBatch);
+		const bb = strokesBBox(batch);
 		const cRect = host.getBoundingClientRect();
 		const canvasRect = this.canvas?.getBoundingClientRect();
 		let left = 16;
@@ -2705,14 +2759,12 @@ class InkOverlay {
 		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
 	}
 
-	private applyHwCandidate(ch: string): void {
+	private applyHwCandidate(ch: string, batch: Stroke[]): void {
+		if (!batch.length || !this.isHwBatchCurrent(batch)) return;
 		this.closePopover();
-		const batch = this.hwBatch;
-		this.hwBatch = [];
-		if (!batch.length) return;
+		this.hwBatch = this.hwBatch.filter((s) => !batch.includes(s));
 		const st = hwTextStroke(batch, ch, this.plugin.settings.hwFont);
 		if (!st) return;
-		// 移除识别用的手写笔迹，插入美化文字
 		this.undoStack.push(this.strokes.slice());
 		this.redoStack.length = 0;
 		if (this.undoStack.length > 50) this.undoStack.shift();
@@ -2754,6 +2806,7 @@ class InkOverlay {
 	private clearAll(): void {
 		this.cancelHwAuto();
 		this.hwBatch = [];
+		this.closePopover();
 		if (!this.strokes.length) return;
 		this.undoStack.push(this.strokes.slice());
 		this.redoStack.length = 0;
@@ -2766,6 +2819,7 @@ class InkOverlay {
 	clearAllForRemove(): void {
 		this.cancelHwAuto();
 		this.hwBatch = [];
+		this.closePopover();
 		this.strokes = [];
 		this.undoStack = [];
 		this.redoStack = [];
@@ -3854,6 +3908,7 @@ class DoodleView extends ItemView {
 	private clear(): void {
 		this.cancelHwAuto();
 		this.hwBatch = [];
+		this.closePopover();
 		if (!this.strokes.length) return;
 		this.pushUndo();
 		this.strokes = [];
@@ -4190,7 +4245,8 @@ class DoodleView extends ItemView {
 			return;
 		}
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
-		if (!this.hwBatch.length) {
+		const batch = this.hwBatch.slice();
+		if (!batch.length) {
 			if (!auto) new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
@@ -4199,10 +4255,15 @@ class DoodleView extends ItemView {
 		const notice = new Notice("手写识别：加载数据…", 0);
 		try {
 			await this.plugin.hwEngine.ensureReady();
+			if (!this.isHwBatchCurrent(batch)) return;
 			notice.setMessage("手写识别：识别中…");
-			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			const pts = batch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			if (!this.isHwBatchCurrent(batch)) {
+				Diag.log("手写识别结果已丢弃：批次已被撤销或清除");
+				return;
+			}
 			const top = cands[0];
 			Diag.log(
 				`手写识别结果 n=${cands.length} backend=${this.plugin.hwEngine.backendName} ` +
@@ -4216,13 +4277,13 @@ class DoodleView extends ItemView {
 			}
 			if (auto) {
 				if (top && top.score >= HW_AUTO_MIN_SCORE) {
-					this.applyHwCandidate(top.character);
+					this.applyHwCandidate(top.character, batch);
 				} else {
 					Diag.log(`自动替换跳过 score=${top ? top.score.toFixed(3) : "-"} < ${HW_AUTO_MIN_SCORE}`);
-					this.showHwCandidates(cands);
+					this.showHwCandidates(cands, batch);
 				}
 			} else {
-				this.showHwCandidates(cands);
+				this.showHwCandidates(cands, batch);
 			}
 		} catch (e) {
 			Diag.log(`手写识别失败: ${String(e)}`);
@@ -4234,20 +4295,25 @@ class DoodleView extends ItemView {
 		}
 	}
 
-	private showHwCandidates(cands: HanziMatch[]): void {
+	private isHwBatchCurrent(batch: Stroke[]): boolean {
+		return batch.every((s) => this.hwBatch.includes(s) && this.strokes.includes(s));
+	}
+
+	private showHwCandidates(cands: HanziMatch[], batch: Stroke[]): void {
+		if (!this.isHwBatchCurrent(batch)) return;
 		this.closePopover();
 		const pop = buildHwCandidatePopover(
 			this.contentEl,
 			cands,
-			(ch) => this.applyHwCandidate(ch),
+			(ch) => this.applyHwCandidate(ch, batch),
 			() => {
-				this.hwBatch = [];
+				this.hwBatch = this.hwBatch.filter((s) => !batch.includes(s));
 				this.closePopover();
 				this.syncToolbar();
 			}
 		);
 		this.popover = pop;
-		const bb = strokesBBox(this.hwBatch);
+		const bb = strokesBBox(batch);
 		const cRect = this.contentEl.getBoundingClientRect();
 		const canvasRect = this.canvas.getBoundingClientRect();
 		let left = 16;
@@ -4274,11 +4340,10 @@ class DoodleView extends ItemView {
 		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
 	}
 
-	private applyHwCandidate(ch: string): void {
+	private applyHwCandidate(ch: string, batch: Stroke[]): void {
+		if (!batch.length || !this.isHwBatchCurrent(batch)) return;
 		this.closePopover();
-		const batch = this.hwBatch;
-		this.hwBatch = [];
-		if (!batch.length) return;
+		this.hwBatch = this.hwBatch.filter((s) => !batch.includes(s));
 		const st = hwTextStroke(batch, ch, this.plugin.settings.hwFont);
 		if (!st) return;
 		this.pushUndo();
