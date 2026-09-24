@@ -3,3 +3,9 @@ main.js
 *.map
 data.json
 hanzi-mmah.json
+ppocrv5_rec.ort
+ppocrv5_dict.txt
+ort-wasm-simd-threaded.wasm
+ort-wasm-simd-threaded.mjs
+ort-probe.ts
+

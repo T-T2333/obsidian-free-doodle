@@ -17,6 +17,7 @@ import {
 	PluginManifest,
 	requestUrl,
 } from "obsidian";
+import * as ort from "onnxruntime-web/wasm";
 import "./hanzilookup.min.js";
 
 const VIEW_TYPE_DOODLE = "free-doodle-view";
@@ -101,7 +102,7 @@ interface DoodleData {
 	strokes: StoredStroke[];
 }
 
-/* ---------- 手写识别（HanziLookupJS，GPL，数据 Make Me a Hanzi / Arphic PL） ---------- */
+/* ---------- 手写识别（主：PP-OCRv5 / 回退：HanziLookupJS） ---------- */
 
 interface HanziMatch {
 	character: string;
@@ -130,6 +131,62 @@ const MMAH_DATA_URLS = [
 	"https://raw.githubusercontent.com/gugray/HanziLookupJS/master/dist/mmah.json",
 ];
 const HW_DATA_FILE = "hanzi-mmah.json";
+
+/** 自动替换的最低置信度（PP-OCR：最优候选占非 blank 概率的质量） */
+const HW_AUTO_MIN_SCORE = 0.5;
+
+const PPOCR_MODEL_FILE = "ppocrv5_rec.ort";
+const PPOCR_DICT_FILE = "ppocrv5_dict.txt";
+const ORT_WASM_FILE = "ort-wasm-simd-threaded.wasm";
+const ORT_MJS_FILE = "ort-wasm-simd-threaded.mjs";
+
+interface HwAsset {
+	file: string;
+	minBytes: number;
+	label: string;
+	urls: string[];
+}
+
+/** 首用下载的 PP-OCR / ORT 运行时资源（约 28MB，缓存到插件目录） */
+const HW_ASSETS: HwAsset[] = [
+	{
+		file: PPOCR_MODEL_FILE,
+		minBytes: 16_000_000,
+		label: "识别模型",
+		urls: [
+			"https://fastly.jsdelivr.net/npm/@ibus-qikai/models@0.1.4/assets/PP-OCRv5_rec_mobile_infer.ort",
+			"https://cdn.jsdelivr.net/npm/@ibus-qikai/models@0.1.4/assets/PP-OCRv5_rec_mobile_infer.ort",
+		],
+	},
+	{
+		file: PPOCR_DICT_FILE,
+		minBytes: 50_000,
+		label: "字符表",
+		urls: [
+			"https://fastly.jsdelivr.net/npm/@ibus-qikai/models@0.1.4/assets/ppocrv5_dict.txt",
+			"https://cdn.jsdelivr.net/npm/@ibus-qikai/models@0.1.4/assets/ppocrv5_dict.txt",
+		],
+	},
+	{
+		file: ORT_WASM_FILE,
+		minBytes: 11_000_000,
+		label: "推理运行时",
+		urls: [
+			"https://fastly.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort-wasm-simd-threaded.wasm",
+			"https://registry.npmmirror.com/onnxruntime-web/1.20.1/files/dist/ort-wasm-simd-threaded.wasm",
+			"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort-wasm-simd-threaded.wasm",
+		],
+	},
+	{
+		file: ORT_MJS_FILE,
+		minBytes: 20_000,
+		label: "推理加载器",
+		urls: [
+			"https://fastly.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort-wasm-simd-threaded.mjs",
+			"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort-wasm-simd-threaded.mjs",
+		],
+	},
+];
 
 /** 笔迹集合的包围盒（含线宽），无有效点返回 null */
 function strokesBBox(strokes: Stroke[]): { x: number; y: number; w: number; h: number } | null {
@@ -198,19 +255,31 @@ function hwTextStroke(batch: Stroke[], ch: string, font: string): Stroke | null 
 }
 
 /**
- * 手写识别引擎：懒加载 HanziLookup 笔画数据（首用下载约 0.8MB 并缓存到插件目录）。
- * 识别基于笔画轨迹而非位图 OCR，离线可用。
+ * 手写识别引擎：首选 PP-OCRv5（位图 OCR，首用下载约 28MB 缓存到插件目录）；
+ * 模型/运行时不可用时回退 HanziLookup 笔画匹配（约 0.8MB）。
  */
 class HandwritingEngine {
 	private ready = false;
 	private loading: Promise<void> | null = null;
+	private backend: "ppocr" | "hanzi" | null = null;
+	private session: ort.InferenceSession | null = null;
+	private dictionary: string[] = [];
+	private mjsBlobUrl: string | null = null;
+	private preCanvas: HTMLCanvasElement | null = null;
+	private preCtx: CanvasRenderingContext2D | null = null;
+	private floatBuf: Float32Array | null = null;
+	private hanziReady = false;
 
 	constructor(private plugin: FreeDoodlePlugin) {}
 
-	private dataPath(): string {
+	get backendName(): string {
+		return this.backend ?? "none";
+	}
+
+	private pluginFile(name: string): string {
 		const dir = this.plugin.manifest.dir;
 		if (!dir) throw new Error("plugin manifest.dir missing");
-		return `${dir}/${HW_DATA_FILE}`;
+		return `${dir}/${name}`;
 	}
 
 	async ensureReady(): Promise<void> {
@@ -225,7 +294,110 @@ class HandwritingEngine {
 	}
 
 	private async load(): Promise<void> {
-		const path = this.dataPath();
+		try {
+			await this.loadPpocr();
+			this.backend = "ppocr";
+			this.ready = true;
+			return;
+		} catch (e) {
+			Diag.log(`PP-OCR 加载失败，回退 HanziLookup: ${String(e)}`);
+		}
+		await this.loadHanzi();
+		this.backend = "hanzi";
+		this.ready = true;
+	}
+
+	private async loadPpocr(): Promise<void> {
+		const adapter = this.plugin.app.vault.adapter;
+		const need = (
+			await Promise.all(
+				HW_ASSETS.map(async (a) => {
+					const path = this.pluginFile(a.file);
+					if (!(await adapter.exists(path))) return true;
+					const st = await adapter.stat(path);
+					return !st || st.type !== "file" || st.size < a.minBytes;
+				})
+			)
+		).some(Boolean);
+
+		let notice: Notice | null = null;
+		if (need) notice = new Notice("手写识别：首次使用需下载模型（约 28 mb），请稍候…", 0);
+		try {
+			for (const asset of HW_ASSETS) {
+				await this.ensureAsset(asset);
+			}
+		} finally {
+			notice?.hide();
+		}
+
+		const dictText = await adapter.read(this.pluginFile(PPOCR_DICT_FILE));
+		if (dictText.includes("<html") || dictText.includes("<!DOCTYPE")) {
+			throw new Error("字符表内容无效（拿到了 HTML）");
+		}
+		// 与 ibus-qikai 一致：索引 0 = CTC blank
+		this.dictionary = ["", ...dictText.split(/\r?\n/)];
+		if (this.dictionary.length < 100) throw new Error("字符表过短");
+
+		const modelBuf = await adapter.readBinary(this.pluginFile(PPOCR_MODEL_FILE));
+		const wasmBuf = await adapter.readBinary(this.pluginFile(ORT_WASM_FILE));
+		const mjsText = await adapter.read(this.pluginFile(ORT_MJS_FILE));
+		if (mjsText.length < 1000 || !mjsText.includes("ortWasm")) {
+			throw new Error("推理加载器内容无效");
+		}
+
+		if (this.mjsBlobUrl) URL.revokeObjectURL(this.mjsBlobUrl);
+		this.mjsBlobUrl = URL.createObjectURL(new Blob([mjsText], { type: "text/javascript" }));
+
+		ort.env.wasm.proxy = false;
+		ort.env.wasm.numThreads = 1;
+		ort.env.wasm.wasmBinary = wasmBuf;
+		ort.env.wasm.wasmPaths = { mjs: this.mjsBlobUrl };
+
+		this.session = await ort.InferenceSession.create(modelBuf, {
+			executionProviders: ["wasm"],
+		});
+		Diag.log(
+			`PP-OCR 就绪 backend=ppocr dict=${this.dictionary.length} inputs=${this.session.inputNames.join(",")}`
+		);
+	}
+
+	private async ensureAsset(asset: HwAsset): Promise<void> {
+		const adapter = this.plugin.app.vault.adapter;
+		const path = this.pluginFile(asset.file);
+		if (await adapter.exists(path)) {
+			try {
+				const st = await adapter.stat(path);
+				if (st && st.type === "file" && st.size >= asset.minBytes) return;
+			} catch {
+				/* fall through to re-download */
+			}
+		}
+		let lastErr: unknown = null;
+		for (const url of asset.urls) {
+			try {
+				const res = await requestUrl({ url, method: "GET", headers: {} });
+				const buf = res.arrayBuffer;
+				if (buf.byteLength < asset.minBytes) {
+					throw new Error(`响应过小 ${buf.byteLength}B`);
+				}
+				await adapter.writeBinary(path, buf);
+				const st = await adapter.stat(path);
+				if (!st || st.size < asset.minBytes) throw new Error("写入校验失败");
+				Diag.log(`已缓存 ${asset.file} ${st.size}B ← ${url}`);
+				return;
+			} catch (e) {
+				lastErr = e;
+				Diag.log(`${asset.label}下载失败 ${url}: ${String(e)}`);
+			}
+		}
+		throw lastErr instanceof Error
+			? lastErr
+			: new Error(`${asset.label}下载失败（请检查网络后重试）`);
+	}
+
+	private async loadHanzi(): Promise<void> {
+		if (this.hanziReady) return;
+		const path = this.pluginFile(HW_DATA_FILE);
 		const adapter = this.plugin.app.vault.adapter;
 		let text: string | null = null;
 		try {
@@ -240,51 +412,270 @@ class HandwritingEngine {
 			const notice = new Notice("手写识别：首次使用需下载汉字数据，请稍候…", 0);
 			let lastErr: unknown = null;
 			try {
-					for (const url of MMAH_DATA_URLS) {
-						try {
-							const res = await requestUrl({ url, method: "GET", headers: {} });
-							const body = res.text;
-							const parsed = JSON.parse(body) as { chars?: unknown; substrokes?: unknown };
-							if (!Array.isArray(parsed.chars) || typeof parsed.substrokes !== "string") {
-								throw new Error("识别数据格式无效");
-							}
-							text = body;
-							lastErr = null;
-							break;
-						} catch (e) {
-							lastErr = e;
-							Diag.log(`手写数据下载失败 ${url}: ${String(e)}`);
+				for (const url of MMAH_DATA_URLS) {
+					try {
+						const res = await requestUrl({ url, method: "GET", headers: {} });
+						const body = res.text;
+						const parsed = JSON.parse(body) as { chars?: unknown; substrokes?: unknown };
+						if (!Array.isArray(parsed.chars) || typeof parsed.substrokes !== "string") {
+							throw new Error("识别数据格式无效");
 						}
+						text = body;
+						lastErr = null;
+						break;
+					} catch (e) {
+						lastErr = e;
+						Diag.log(`手写数据下载失败 ${url}: ${String(e)}`);
 					}
-					if (text === null) {
-						throw lastErr instanceof Error
-							? lastErr
-							: new Error("识别数据下载失败（请检查网络/代理后重试）");
-					}
-				} finally {
-					notice.hide();
 				}
-				try {
-					await adapter.write(path, text);
-				} catch (e) {
-					Diag.log(`手写数据缓存失败: ${String(e)}`);
+				if (text === null) {
+					throw lastErr instanceof Error
+						? lastErr
+						: new Error("识别数据下载失败（请检查网络/代理后重试）");
 				}
+			} finally {
+				notice.hide();
 			}
-			const json = JSON.parse(text) as { chars: unknown[]; substrokes: string };
-			if (!Array.isArray(json.chars) || typeof json.substrokes !== "string") {
-				throw new Error("识别数据格式无效，请删除插件目录内 hanzi-mmah.json 后重试");
+			try {
+				await adapter.write(path, text);
+			} catch (e) {
+				Diag.log(`手写数据缓存失败: ${String(e)}`);
 			}
-			const HL = getHanziLookup();
+		}
+		const json = JSON.parse(text) as { chars: unknown[]; substrokes: string };
+		if (!Array.isArray(json.chars) || typeof json.substrokes !== "string") {
+			throw new Error("识别数据格式无效，请删除插件目录内 hanzi-mmah.json 后重试");
+		}
+		const HL = getHanziLookup();
 		if (!HL) throw new Error("识别引擎未加载（请重新启用插件）");
 		HL.data["mmah"] = {
 			chars: json.chars,
 			substrokes: HL.decodeCompact(json.substrokes),
 		};
-		this.ready = true;
+		this.hanziReady = true;
 		Diag.log(`手写数据就绪 chars=${json.chars.length}`);
 	}
 
+	dispose(): void {
+		this.session = null;
+		this.dictionary = [];
+		if (this.mjsBlobUrl) {
+			URL.revokeObjectURL(this.mjsBlobUrl);
+			this.mjsBlobUrl = null;
+		}
+		this.preCanvas = null;
+		this.preCtx = null;
+		this.floatBuf = null;
+		this.ready = false;
+		this.backend = null;
+		this.hanziReady = false;
+	}
+
 	recognize(strokes: number[][][], limit = 6): Promise<HanziMatch[]> {
+		if (this.backend === "ppocr") return this.recognizePpocr(strokes, limit);
+		return this.recognizeHanzi(strokes, limit);
+	}
+
+	/** 清洗点列：丢弃非有限坐标与空笔（单点以圆点形式保留在渲染阶段） */
+	private cleanStrokes(strokes: number[][][]): number[][][] {
+		return strokes
+			.map((s) => s.filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1])))
+			.filter((s) => s.length > 0);
+	}
+
+	/** 笔迹 → 黑色墨迹画布（透明底），供 OCR 裁剪 */
+	private renderInk(strokes: number[][][]): HTMLCanvasElement | null {
+		let minX = Infinity;
+		let minY = Infinity;
+		let maxX = -Infinity;
+		let maxY = -Infinity;
+		let any = false;
+		for (const s of strokes) {
+			for (const p of s) {
+				any = true;
+				if (p[0] < minX) minX = p[0];
+				if (p[1] < minY) minY = p[1];
+				if (p[0] > maxX) maxX = p[0];
+				if (p[1] > maxY) maxY = p[1];
+			}
+		}
+		if (!any) return null;
+		const pad = 6;
+		const w = Math.max(1, maxX - minX + pad * 2);
+		const h = Math.max(1, maxY - minY + pad * 2);
+		// 限制渲染分辨率，避免超大笔迹撑爆内存
+		const scale = Math.min(3, 240 / Math.max(w, h));
+		const cw = Math.max(1, Math.ceil(w * scale));
+		const ch = Math.max(1, Math.ceil(h * scale));
+		const canvas = createEl("canvas");
+		canvas.width = cw;
+		canvas.height = ch;
+		const ctx = canvas.getContext("2d", { willReadFrequently: true });
+		if (!ctx) return null;
+		ctx.clearRect(0, 0, cw, ch);
+		ctx.save();
+		ctx.scale(scale, scale);
+		ctx.translate(-minX + pad, -minY + pad);
+		ctx.strokeStyle = "#000000";
+		ctx.fillStyle = "#000000";
+		ctx.lineCap = "round";
+		ctx.lineJoin = "round";
+		const lw = Math.max(2, Math.min(w, h) * 0.07);
+		ctx.lineWidth = lw;
+		for (const s of strokes) {
+			if (s.length === 1) {
+				ctx.beginPath();
+				ctx.arc(s[0][0], s[0][1], lw / 2, 0, Math.PI * 2);
+				ctx.fill();
+				continue;
+			}
+			ctx.beginPath();
+			ctx.moveTo(s[0][0], s[0][1]);
+			for (let i = 1; i < s.length; i++) ctx.lineTo(s[i][0], s[i][1]);
+			ctx.stroke();
+		}
+		ctx.restore();
+		return canvas;
+	}
+
+	/** 与 ibus-qikai 相同的预处理：裁剪 → 48×128 灰底 → BGR 归一化 */
+	private preprocess(source: HTMLCanvasElement): Float32Array | null {
+		const imgH = 48;
+		const imgW = 128;
+		const srcCtx = source.getContext("2d", { willReadFrequently: true });
+		if (!srcCtx) return null;
+		const sw = source.width;
+		const sh = source.height;
+		const srcData = srcCtx.getImageData(0, 0, sw, sh).data;
+		let minX = sw;
+		let minY = sh;
+		let maxX = 0;
+		let maxY = 0;
+		let has = false;
+		const step = 2;
+		for (let y = 0; y < sh; y += step) {
+			for (let x = 0; x < sw; x += step) {
+				if (srcData[(y * sw + x) * 4 + 3] > 0) {
+					if (x < minX) minX = x;
+					if (x > maxX) maxX = x;
+					if (y < minY) minY = y;
+					if (y > maxY) maxY = y;
+					has = true;
+				}
+			}
+		}
+		if (!has) return null;
+		const box = {
+			x: minX,
+			y: minY,
+			w: maxX - minX + 1,
+			h: maxY - minY + 1,
+		};
+
+		if (!this.preCanvas) {
+			this.preCanvas = createEl("canvas");
+			this.preCanvas.width = imgW;
+			this.preCanvas.height = imgH;
+			this.preCtx = this.preCanvas.getContext("2d", { willReadFrequently: true });
+		}
+		const ctx = this.preCtx;
+		if (!ctx) return null;
+		ctx.fillStyle = "rgb(128, 128, 128)";
+		ctx.fillRect(0, 0, imgW, imgH);
+		const padding = 6;
+		const availableH = imgH - padding * 2;
+		const scale = availableH / box.h;
+		const drawW = box.w * scale;
+		const dx = (imgW - drawW) / 2;
+		ctx.drawImage(source, box.x, box.y, box.w, box.h, dx, padding, drawW, availableH);
+
+		const imageData = ctx.getImageData(0, 0, imgW, imgH);
+		const data = imageData.data;
+		const n = imgH * imgW;
+		if (!this.floatBuf || this.floatBuf.length !== n * 3) {
+			this.floatBuf = new Float32Array(n * 3);
+		}
+		const floatData = this.floatBuf;
+		for (let i = 0; i < n; i++) {
+			const r = data[i * 4] / 255;
+			const g = data[i * 4 + 1] / 255;
+			const b = data[i * 4 + 2] / 255;
+			// 与模型训练一致：BGR，(x - 0.5) / 0.5
+			floatData[i] = (b - 0.5) / 0.5;
+			floatData[n + i] = (g - 0.5) / 0.5;
+			floatData[2 * n + i] = (r - 0.5) / 0.5;
+		}
+		return floatData;
+	}
+
+	/** CTC：峰值帧非 blank top-K；score = 该字符概率 / 非 blank 总概率 */
+	private postprocess(out: Float32Array, dims: readonly number[], limit: number): HanziMatch[] {
+		const seqLen = dims.length >= 3 ? dims[1] : 0;
+		const dictSize = dims.length >= 3 ? dims[2] : 0;
+		if (seqLen <= 0 || dictSize <= 0) return [];
+		let bestT = -1;
+		let maxNonBlank = -1;
+		for (let t = 0; t < seqLen; t++) {
+			const blank = out[t * dictSize];
+			const nonBlank = 1 - blank;
+			if (nonBlank > maxNonBlank) {
+				maxNonBlank = nonBlank;
+				bestT = t;
+			}
+		}
+		if (bestT < 0 || maxNonBlank < 0.001) return [];
+		const frameStart = bestT * dictSize;
+		const thr = 0.0001 * maxNonBlank;
+		const items: { index: number; prob: number }[] = [];
+		for (let i = 1; i < dictSize; i++) {
+			const prob = out[frameStart + i];
+			if (prob > thr) items.push({ index: i, prob });
+		}
+		items.sort((a, b) => b.prob - a.prob);
+		const top = items.slice(0, limit);
+		return top
+			.map((item) => {
+				const character = this.dictionary[item.index] ?? "";
+				return {
+					character,
+					score: item.prob / maxNonBlank,
+				};
+			})
+			.filter((m) => m.character.length > 0 && Number.isFinite(m.score));
+	}
+
+	private async recognizePpocr(strokes: number[][][], limit: number): Promise<HanziMatch[]> {
+		const session = this.session;
+		if (!session) return Promise.reject(new Error("PP-OCR 会话未就绪"));
+		const cleaned = this.cleanStrokes(strokes);
+		if (!cleaned.length) return [];
+		const ink = this.renderInk(cleaned);
+		if (!ink) return [];
+		const data = this.preprocess(ink);
+		if (!data) return [];
+		const inputName = session.inputNames[0];
+		if (!inputName) return [];
+		const tensor = new ort.Tensor("float32", data, [1, 3, 48, 128]);
+		try {
+			const results = await session.run({ [inputName]: tensor });
+			const outName = session.outputNames[0];
+			const output = outName ? results[outName] : undefined;
+			if (!output) return [];
+			const matches = this.postprocess(
+				output.data as Float32Array,
+				output.dims,
+				limit
+			);
+			for (const key of Object.keys(results)) {
+				results[key]?.dispose();
+			}
+			return matches;
+		} finally {
+			tensor.dispose();
+		}
+	}
+
+	private recognizeHanzi(strokes: number[][][], limit: number): Promise<HanziMatch[]> {
 		const HL = getHanziLookup();
 		if (!HL) return Promise.reject(new Error("识别引擎未加载"));
 		// 识别器要求每笔 ≥2 个有效点；空/单点笔画会抛错或永不回调
@@ -2236,13 +2627,25 @@ class InkOverlay {
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
-			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
+			const top = cands[0];
+			Diag.log(
+				`手写识别结果 n=${cands.length} backend=${this.plugin.hwEngine.backendName} ` +
+					(cands.length
+						? cands.map((c) => `${c.character}(${c.score.toFixed(3)})`).join(" ")
+						: "(empty)")
+			);
 			if (!cands.length) {
 				if (!auto) new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
 			if (auto) {
-				this.applyHwCandidate(cands[0].character);
+				if (top && top.score >= HW_AUTO_MIN_SCORE) {
+					this.applyHwCandidate(top.character);
+				} else {
+					// 低置信：不盲替换，弹出候选
+					Diag.log(`自动替换跳过 score=${top ? top.score.toFixed(3) : "-"} < ${HW_AUTO_MIN_SCORE}`);
+					this.showHwCandidates(cands);
+				}
 			} else {
 				this.showHwCandidates(cands);
 			}
@@ -3800,13 +4203,24 @@ class DoodleView extends ItemView {
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
-			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
+			const top = cands[0];
+			Diag.log(
+				`手写识别结果 n=${cands.length} backend=${this.plugin.hwEngine.backendName} ` +
+					(cands.length
+						? cands.map((c) => `${c.character}(${c.score.toFixed(3)})`).join(" ")
+						: "(empty)")
+			);
 			if (!cands.length) {
 				if (!auto) new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
 			if (auto) {
-				this.applyHwCandidate(cands[0].character);
+				if (top && top.score >= HW_AUTO_MIN_SCORE) {
+					this.applyHwCandidate(top.character);
+				} else {
+					Diag.log(`自动替换跳过 score=${top ? top.score.toFixed(3) : "-"} < ${HW_AUTO_MIN_SCORE}`);
+					this.showHwCandidates(cands);
+				}
 			} else {
 				this.showHwCandidates(cands);
 			}
@@ -4098,6 +4512,7 @@ export default class FreeDoodlePlugin extends Plugin {
 		}
 		this.overlays.clear();
 		this.activePath = null;
+		this.hwEngine.dispose();
 	}
 
 	async loadSettings(): Promise<void> {
