@@ -994,6 +994,7 @@ class InkOverlay {
 	/** 手写识别模式下累计的笔迹（识别后替换为美化文字） */
 	private hwBatch: Stroke[] = [];
 	private hwBusy = false;
+	private hwAutoT: number | null = null;
 
 	private swatchEls: HTMLElement[] = [];
 	private colorInputEl!: HTMLInputElement;
@@ -1099,6 +1100,7 @@ class InkOverlay {
 	destroy(save: boolean): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
+		this.cancelHwAuto();
 		this.mo?.disconnect();
 		this.mo = undefined;
 		this.ro?.disconnect();
@@ -1316,11 +1318,11 @@ class InkOverlay {
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
-		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：先点这里，手绘一个字，再点 ✨", () =>
+		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：写一个字，停顿后自动替换为美化字", () =>
 			this.setMode("hw")
 		);
-		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹（需先用手写工具写几笔）", () =>
-			void this.runHandwriting()
+		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "手动识别并挑选候选（自动识别的兜底）", () =>
+			void this.runHandwriting(false)
 		);
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -1420,7 +1422,7 @@ class InkOverlay {
 				this.clearAll();
 				return;
 			case "hwrun":
-				void this.runHandwriting();
+				void this.runHandwriting(false);
 				return;
 			default:
 				this.setMode(id);
@@ -1723,10 +1725,11 @@ class InkOverlay {
 		if (mode === "hw" && this.tool.mode !== "hw") {
 			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 			Diag.log(`setMode→hw batch=${this.hwBatch.length}`);
-			new Notice("手写模式：在此模式下写一个字（可多笔），写完点 ✨ 识别");
+			new Notice("手写模式：写一个字，停顿约 1 秒后自动替换为美化字");
 		} else {
 			Diag.log(`setMode ${this.tool.mode}→${mode}`);
 		}
+		if (mode !== "hw") this.cancelHwAuto();
 		this.tool.mode = mode;
 		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明
 		// （笔迹 alpha 取自 curCfg().opacity，必须改笔刷配置而非 tool.opacity）
@@ -2177,6 +2180,7 @@ class InkOverlay {
 			this.redraw();
 			this.scheduleSave();
 			this.syncTool();
+			this.scheduleHwAuto();
 			return;
 		}
 		if (this.plugin.settings.autoFit) {
@@ -2194,14 +2198,33 @@ class InkOverlay {
 		this.syncTool();
 	};
 
-	/** 识别 hwBatch → 弹出候选 → 采用后替换为美化字体文字笔迹 */
-	private async runHandwriting(): Promise<void> {
-		Diag.log(`runHandwriting mode=${this.tool.mode} batch=${this.hwBatch.length} busy=${this.hwBusy}`);
-		if (this.hwBusy) return;
+	/** 手写停顿后自动识别并直接替换为最优候选（✨ 为手动挑选兜底） */
+	private scheduleHwAuto(): void {
+		this.cancelHwAuto();
+		this.hwAutoT = window.setTimeout(() => {
+			this.hwAutoT = null;
+			void this.runHandwriting(true);
+		}, 900);
+	}
+
+	private cancelHwAuto(): void {
+		if (this.hwAutoT !== null) {
+			window.clearTimeout(this.hwAutoT);
+			this.hwAutoT = null;
+		}
+	}
+
+	/** 识别 hwBatch → auto=true 直接替换最优候选；auto=false 弹候选供手选 */
+	private async runHandwriting(auto = false): Promise<void> {
+		Diag.log(`runHandwriting mode=${this.tool.mode} batch=${this.hwBatch.length} busy=${this.hwBusy} auto=${auto}`);
+		if (this.hwBusy) {
+			if (auto) this.scheduleHwAuto();
+			return;
+		}
 		// 识别前剔除已被撤销/擦除的笔画
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
+			if (!auto) new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
@@ -2215,13 +2238,17 @@ class InkOverlay {
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
 			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
 			if (!cands.length) {
-				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
+				if (!auto) new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
-			this.showHwCandidates(cands);
+			if (auto) {
+				this.applyHwCandidate(cands[0].character);
+			} else {
+				this.showHwCandidates(cands);
+			}
 		} catch (e) {
 			Diag.log(`手写识别失败: ${String(e)}`);
-			new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
+			if (!auto) new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			notice.hide();
 			this.hwBusy = false;
@@ -2322,6 +2349,7 @@ class InkOverlay {
 	}
 
 	private clearAll(): void {
+		this.cancelHwAuto();
 		this.hwBatch = [];
 		if (!this.strokes.length) return;
 		this.undoStack.push(this.strokes.slice());
@@ -2333,6 +2361,7 @@ class InkOverlay {
 	}
 
 	clearAllForRemove(): void {
+		this.cancelHwAuto();
 		this.hwBatch = [];
 		this.strokes = [];
 		this.undoStack = [];
@@ -2852,6 +2881,7 @@ class DoodleView extends ItemView {
 	/** 手写识别批次与忙碌状态 */
 	private hwBatch: Stroke[] = [];
 	private hwBusy = false;
+	private hwAutoT: number | null = null;
 
 	private rect: DOMRect | null = null;
 	private cw = 0;
@@ -2944,6 +2974,7 @@ class DoodleView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.cancelHwAuto();
 		this.closePopover();
 		this.ro?.disconnect();
 		this.contentEl.empty();
@@ -2983,8 +3014,8 @@ class DoodleView extends ItemView {
 		}
 
 		toolbar.createDiv({ cls: "free-doodle-sep" });
-		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹", () =>
-			void this.runHandwriting()
+		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "手动识别并挑选候选（自动识别的兜底）", () =>
+			void this.runHandwriting(false)
 		);
 		toolbar.createDiv({ cls: "free-doodle-sep" });
 
@@ -3087,7 +3118,7 @@ class DoodleView extends ItemView {
 			return;
 		}
 		if (id === "hwrun") {
-			void this.runHandwriting();
+			void this.runHandwriting(false);
 			return;
 		}
 		this.setBoardMode(id);
@@ -3342,10 +3373,11 @@ class DoodleView extends ItemView {
 		if (mode === "hw" && this.mode !== "hw") {
 			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 			Diag.log(`setBoardMode→hw batch=${this.hwBatch.length}`);
-			new Notice("手写模式：在此模式下写一个字（可多笔），写完点 ✨ 识别");
+			new Notice("手写模式：写一个字，停顿约 1 秒后自动替换为美化字");
 		} else {
 			Diag.log(`setBoardMode ${this.mode}→${mode}`);
 		}
+		if (mode !== "hw") this.cancelHwAuto();
 		this.mode = mode;
 		// 荧光笔透明度同样写入笔刷配置（笔迹 alpha 来源）
 		if (mode === "hl") {
@@ -3417,6 +3449,7 @@ class DoodleView extends ItemView {
 	}
 
 	private clear(): void {
+		this.cancelHwAuto();
 		this.hwBatch = [];
 		if (!this.strokes.length) return;
 		this.pushUndo();
@@ -3716,6 +3749,7 @@ class DoodleView extends ItemView {
 			this.strokes.push(final);
 			this.redraw();
 			this.syncToolbar();
+			this.scheduleHwAuto();
 			return;
 		}
 		if (this.plugin.settings.autoFit) {
@@ -3729,13 +3763,32 @@ class DoodleView extends ItemView {
 		this.syncToolbar();
 	}
 
-	/** 识别 hwBatch → 候选弹层 → 采用后替换为美化文字 */
-	private async runHandwriting(): Promise<void> {
-		Diag.log(`runHandwriting mode=${this.mode} batch=${this.hwBatch.length} busy=${this.hwBusy}`);
-		if (this.hwBusy) return;
+	/** 手写停顿后自动识别并直接替换为最优候选（✨ 为手动挑选兜底） */
+	private scheduleHwAuto(): void {
+		this.cancelHwAuto();
+		this.hwAutoT = window.setTimeout(() => {
+			this.hwAutoT = null;
+			void this.runHandwriting(true);
+		}, 900);
+	}
+
+	private cancelHwAuto(): void {
+		if (this.hwAutoT !== null) {
+			window.clearTimeout(this.hwAutoT);
+			this.hwAutoT = null;
+		}
+	}
+
+	/** 识别 hwBatch → auto=true 直接替换最优候选；auto=false 弹候选供手选 */
+	private async runHandwriting(auto = false): Promise<void> {
+		Diag.log(`runHandwriting mode=${this.mode} batch=${this.hwBatch.length} busy=${this.hwBusy} auto=${auto}`);
+		if (this.hwBusy) {
+			if (auto) this.scheduleHwAuto();
+			return;
+		}
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
+			if (!auto) new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
@@ -3749,13 +3802,17 @@ class DoodleView extends ItemView {
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
 			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
 			if (!cands.length) {
-				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
+				if (!auto) new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
-			this.showHwCandidates(cands);
+			if (auto) {
+				this.applyHwCandidate(cands[0].character);
+			} else {
+				this.showHwCandidates(cands);
+			}
 		} catch (e) {
 			Diag.log(`手写识别失败: ${String(e)}`);
-			new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
+			if (!auto) new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
 		} finally {
 			notice.hide();
 			this.hwBusy = false;
@@ -3951,7 +4008,7 @@ export default class FreeDoodlePlugin extends Plugin {
 
 		this.addCommand({
 			id: "handwriting-mode",
-			name: "手写识别模式（写一个字后识别为美化字体）",
+			name: "手写识别模式（写一个字，停顿后自动美化替换）",
 			callback: () => {
 				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 				const ov = view ? this.overlays.get(view) : undefined;
