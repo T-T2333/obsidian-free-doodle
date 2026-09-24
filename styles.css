@@ -136,6 +136,14 @@
 	color: var(--interactive-accent);
 }
 
+.free-doodle-pop-toggle {
+	width: 1.15em;
+	height: 1.15em;
+	margin: 0;
+	accent-color: var(--interactive-accent);
+	cursor: pointer;
+}
+
 .free-doodle-pop-item.is-active {
 	background-color: var(--interactive-accent-hover);
 }

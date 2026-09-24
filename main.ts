@@ -1894,11 +1894,10 @@ class InkOverlay {
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
-		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：写一行，停顿后自动替换为美化文字", () =>
-			this.setMode("hw")
-		);
-		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "手动识别并编辑整行（自动识别的兜底）", () =>
-			void this.runHandwriting(false)
+		this.toolBtnEls["hw"] = mkBtn(
+			"languages",
+			"手写识别：点击进入；再次点击手动识别并编辑整行",
+			() => this.onToolClick("hw")
 		);
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -1919,8 +1918,8 @@ class InkOverlay {
 
 		this.toolBtnEls["fit"] = mkBtn(
 			"check-check",
-			"一键修正：最后一笔拟合为直线/矩形/椭圆",
-			() => this.fitLast()
+			"自动拟合普通笔刷：点击开/关",
+			() => this.toggleAutoFit()
 		);
 
 		tb.createDiv({ cls: "free-doodle-sep" });
@@ -1955,28 +1954,16 @@ class InkOverlay {
 		this.syncTool();
 	}
 
-	private fitLast(): void {
-		// 从最后一笔向前找到最近的可拟合自由笔迹（跳过形状/文本/擦除笔）
-		for (let i = this.strokes.length - 1; i >= 0; i--) {
-			const s = this.strokes[i];
-			if (s.erase || s.shape || s.text) continue;
-			const fitted = fitFreehand(s);
-			if (!fitted) continue;
-			this.undoStack.push(this.strokes.slice());
-			if (this.undoStack.length > 50) this.undoStack.shift();
-			this.redoStack.length = 0;
-			this.strokes[i] = fitted;
-			this.syncTool();
-			this.redraw();
-			this.scheduleSave();
-			new Notice("已修正为规则图形");
-			return;
-		}
-		new Notice("最近的自由笔迹无法拟合为规则图形");
+	private toggleAutoFit(): void {
+		const next = !this.plugin.settings.autoFit;
+		this.plugin.settings.autoFit = next;
+		void this.plugin.saveSettings();
+		this.syncTool();
+		new Notice(next ? "普通笔刷自动拟合：开" : "普通笔刷自动拟合：关");
 	}
 
 	private onToolClick(
-		id: ToolMode | "erase" | "style" | "mic" | "undo" | "trash" | "hwrun"
+		id: ToolMode | "erase" | "style" | "mic" | "undo" | "trash"
 	): void {
 		switch (id) {
 			case "style":
@@ -1997,8 +1984,12 @@ class InkOverlay {
 			case "trash":
 				this.clearAll();
 				return;
-			case "hwrun":
-				void this.runHandwriting(false);
+			case "hw":
+				if (this.tool.mode === "hw") {
+					void this.runHandwriting(false);
+				} else {
+					this.setMode("hw");
+				}
 				return;
 			default:
 				this.setMode(id);
@@ -2220,17 +2211,17 @@ class InkOverlay {
 			});
 
 			const afRow = el.createDiv({ cls: "free-doodle-pop-row" });
-			afRow.createSpan({ cls: "free-doodle-pop-label", text: "自动拟合" });
-			const afBtn = afRow.createEl("button", {
-				cls: "free-doodle-btn free-doodle-wpreset",
-				text: this.plugin.settings.autoFit ? "开" : "关",
+			afRow.createSpan({ cls: "free-doodle-pop-label", text: "自动拟合普通笔刷" });
+			const afToggle = afRow.createEl("input", {
+				cls: "free-doodle-pop-toggle",
+				type: "checkbox",
+				attr: { title: "关闭后普通笔刷保留原始曲线" },
 			});
-			afBtn.toggleClass("is-active", this.plugin.settings.autoFit);
-			afBtn.addEventListener("click", () => {
-				this.plugin.settings.autoFit = !this.plugin.settings.autoFit;
-				afBtn.setText(this.plugin.settings.autoFit ? "开" : "关");
-				afBtn.toggleClass("is-active", this.plugin.settings.autoFit);
-				this.queueSaveSettings();
+			afToggle.checked = this.plugin.settings.autoFit;
+			afToggle.addEventListener("change", () => {
+				this.plugin.settings.autoFit = afToggle.checked;
+				void this.plugin.saveSettings();
+				this.syncTool();
 			});
 
 			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
@@ -2362,8 +2353,15 @@ class InkOverlay {
 		}
 		const textBtn = this.toolBtnEls["text"];
 		if (textBtn) textBtn.toggleClass("is-active", this.tool.mode === "text");
-		const hwRunBtn = this.toolBtnEls["hwrun"] as HTMLButtonElement | undefined;
-		if (hwRunBtn) hwRunBtn.disabled = this.hwBusy || this.hwBatch.length === 0;
+		const fitBtn = this.toolBtnEls["fit"];
+		if (fitBtn) {
+			fitBtn.toggleClass("is-active", this.plugin.settings.autoFit);
+			fitBtn.setAttribute("aria-pressed", String(this.plugin.settings.autoFit));
+			fitBtn.setAttribute(
+				"title",
+				this.plugin.settings.autoFit ? "关闭普通笔刷自动拟合" : "开启普通笔刷自动拟合"
+			);
+		}
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
@@ -3598,7 +3596,7 @@ class DoodleView extends ItemView {
 			{ id: "laser" as const, icon: "flashlight", title: "激光笔（发光）" },
 			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
 			{ id: "text" as const, icon: "type", title: "文本标注：点击画布插入文字" },
-			{ id: "hw" as const, icon: "languages", title: "手写识别：手绘一行，识别后转为美化文字" },
+			{ id: "hw" as const, icon: "languages", title: "手写识别：点击进入；再次点击手动识别并编辑整行" },
 			{ id: "erase" as const, icon: "eraser", title: "橡皮：像素 / 整笔擦除" },
 		];
 		for (const t of tools) {
@@ -3608,10 +3606,12 @@ class DoodleView extends ItemView {
 		}
 
 		toolbar.createDiv({ cls: "free-doodle-sep" });
-		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "手动识别并编辑整行（自动识别的兜底）", () =>
-			void this.runHandwriting(false)
+
+		this.toolBtnEls["fit"] = mkBtn(
+			"check-check",
+			"自动拟合普通笔刷：点击开/关",
+			() => this.toggleAutoFit()
 		);
-		toolbar.createDiv({ cls: "free-doodle-sep" });
 
 		this.styleBtnEl = mkBtn("settings-2", "样式：颜色 / 粗细 / 不透明度 / 笔迹优化", () =>
 			this.openBoardStylePopover(this.styleBtnEl)
@@ -3702,7 +3702,7 @@ class DoodleView extends ItemView {
 		}
 	}
 
-	private onBoardToolClick(id: BoardTool | "erase" | "hwrun"): void {
+	private onBoardToolClick(id: BoardTool | "erase"): void {
 		if (id === "shape") {
 			this.openBoardShapePopover(this.toolBtnEls["shape"] ?? this.styleBtnEl);
 			return;
@@ -3711,8 +3711,12 @@ class DoodleView extends ItemView {
 			this.openBoardErasePopover(this.toolBtnEls["erase"] ?? this.styleBtnEl);
 			return;
 		}
-		if (id === "hwrun") {
-			void this.runHandwriting(false);
+		if (id === "hw") {
+			if (this.mode === "hw") {
+				void this.runHandwriting(false);
+			} else {
+				this.setBoardMode("hw");
+			}
 			return;
 		}
 		this.setBoardMode(id);
@@ -3746,8 +3750,15 @@ class DoodleView extends ItemView {
 		}
 		const textBtn = this.toolBtnEls["text"];
 		if (textBtn) textBtn.toggleClass("is-active", this.mode === "text");
-		const hwRunBtn = this.toolBtnEls["hwrun"] as HTMLButtonElement | undefined;
-		if (hwRunBtn) hwRunBtn.disabled = this.hwBusy || this.hwBatch.length === 0;
+		const fitBtn = this.toolBtnEls["fit"];
+		if (fitBtn) {
+			fitBtn.toggleClass("is-active", this.plugin.settings.autoFit);
+			fitBtn.setAttribute("aria-pressed", String(this.plugin.settings.autoFit));
+			fitBtn.setAttribute(
+				"title",
+				this.plugin.settings.autoFit ? "关闭普通笔刷自动拟合" : "开启普通笔刷自动拟合"
+			);
+		}
 		this.widthPresetEls.forEach((el) =>
 			el.toggleClass("is-active", Number(el.dataset.size) === this.curCfg().size)
 		);
@@ -3890,6 +3901,20 @@ class DoodleView extends ItemView {
 				void this.plugin.saveSettings();
 			});
 
+			const afRow = el.createDiv({ cls: "free-doodle-pop-row" });
+			afRow.createSpan({ cls: "free-doodle-pop-label", text: "自动拟合普通笔刷" });
+			const afToggle = afRow.createEl("input", {
+				cls: "free-doodle-pop-toggle",
+				type: "checkbox",
+				attr: { title: "关闭后普通笔刷保留原始曲线" },
+			});
+			afToggle.checked = this.plugin.settings.autoFit;
+			afToggle.addEventListener("change", () => {
+				this.plugin.settings.autoFit = afToggle.checked;
+				void this.plugin.saveSettings();
+				this.syncToolbar();
+			});
+
 			const smRow = el.createDiv({ cls: "free-doodle-pop-row" });
 			smRow.createSpan({ cls: "free-doodle-pop-label", text: "优化" });
 			const smBtn = smRow.createEl("button", {
@@ -3961,6 +3986,14 @@ class DoodleView extends ItemView {
 				});
 			}
 		});
+	}
+
+	private toggleAutoFit(): void {
+		const next = !this.plugin.settings.autoFit;
+		this.plugin.settings.autoFit = next;
+		void this.plugin.saveSettings();
+		this.syncToolbar();
+		new Notice(next ? "普通笔刷自动拟合：开" : "普通笔刷自动拟合：关");
 	}
 
 	private setBoardMode(mode: BoardTool): void {
@@ -5095,8 +5128,8 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 		);
 
 		new Setting(containerEl)
-			.setName("自动拟合图形")
-			.setDesc("随手画的闭合图形自动修正为规则形状（直线/矩形/椭圆）")
+			.setName("自动拟合普通笔刷")
+			.setDesc("关闭后普通笔刷保留原始曲线；工具栏的手动修正仍可单独使用")
 			.addToggle((tb) =>
 				tb.setValue(this.plugin.settings.autoFit).onChange(async (v) => {
 					this.plugin.settings.autoFit = v;
@@ -5196,8 +5229,8 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 					},
 				},
 				{
-					name: "Auto fit shapes 自动拟合图形",
-					desc: "Freehand closed shapes snap to perfect geometry. 手绘闭合图形自动修正。",
+					name: "Auto fit ordinary brushes 自动拟合普通笔刷",
+					desc: "When off, ordinary brushes keep their original curves. 关闭后普通笔刷保留原始曲线。",
 					control: {
 						type: "toggle",
 						key: "autoFit",
