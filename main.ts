@@ -14,7 +14,10 @@ import {
 	WorkspaceLeaf,
 	normalizePath,
 	setIcon,
+	PluginManifest,
+	requestUrl,
 } from "obsidian";
+import "./hanzilookup.min.js";
 
 const VIEW_TYPE_DOODLE = "free-doodle-view";
 const BLOCK_LANG = "free-doodle";
@@ -59,7 +62,9 @@ interface Stroke {
 	pr?: number[];
 	/** 文本标注内容 */
 	text?: string;
-	/** 浓度 0-100（铅笔颗粒/马克笔叠层） */
+	/** 文本字体族（手写识别美化文字用；缺省用笔记正文字体） */
+	font?: string;
+	/** 浓度 0-100（铅笔颗粒、马克笔叠层） */
 	density?: number;
 	/** 文字块指纹（所在段落/行的规范化文本前 80 字符） */
 	k?: string;
@@ -81,6 +86,7 @@ interface StoredStroke {
 	w?: number[];
 	pr?: number[];
 	text?: string;
+	font?: string;
 	density?: number;
 	k?: string;
 	o?: number;
@@ -95,12 +101,178 @@ interface DoodleData {
 	strokes: StoredStroke[];
 }
 
+/* ---------- 手写识别（HanziLookupJS，GPL，数据 Make Me a Hanzi / Arphic PL） ---------- */
+
+interface HanziMatch {
+	character: string;
+	score: number;
+}
+
+interface HanziLookupApi {
+	data: Record<string, { chars: unknown[]; substrokes: string | Uint8Array }>;
+	decodeCompact(s: string): Uint8Array;
+	AnalyzedCharacter: new (strokes: number[][][]) => unknown;
+	Matcher: new (name: string) => {
+		match(ac: unknown, limit: number, cb: (matches: HanziMatch[]) => void): void;
+	};
+}
+
+/** 库由 hanzilookup.min.js 挂到 window（脚本内 var 与 declare global 会冲突，故显式取用） */
+function getHanziLookup(): HanziLookupApi {
+	return (window as unknown as { HanziLookup: HanziLookupApi }).HanziLookup;
+}
+
+const MMAH_DATA_URL = "https://cdn.jsdelivr.net/gh/gugray/HanziLookupJS@master/dist/mmah.json";
+const HW_DATA_FILE = "hanzi-mmah.json";
+
+/** 笔迹集合的包围盒（含线宽），无有效点返回 null */
+function strokesBBox(strokes: Stroke[]): { x: number; y: number; w: number; h: number } | null {
+	let minX = Infinity;
+	let minY = Infinity;
+	let maxX = -Infinity;
+	let maxY = -Infinity;
+	let any = false;
+	for (const s of strokes) {
+		if (s.erase || s.shape) continue;
+		const pad = Math.max(2, s.size / 2);
+		for (const p of s.points) {
+			any = true;
+			if (p.x - pad < minX) minX = p.x - pad;
+			if (p.y - pad < minY) minY = p.y - pad;
+			if (p.x + pad > maxX) maxX = p.x + pad;
+			if (p.y + pad > maxY) maxY = p.y + pad;
+		}
+	}
+	if (!any || maxX <= minX || maxY <= minY) return null;
+	return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+}
+
+/** 识别候选弹层：点选采用，或保留手写笔迹 */
+function buildHwCandidatePopover(
+	host: HTMLElement,
+	cands: HanziMatch[],
+	onPick: (ch: string) => void,
+	onKeep: () => void
+): HTMLElement {
+	const pop = host.createDiv({ cls: "free-doodle-popover free-doodle-hw-pop" });
+	pop.createDiv({ cls: "free-doodle-pop-label", text: "识别结果 · 点击采用" });
+	const row = pop.createDiv({ cls: "free-doodle-pop-row free-doodle-hw-row" });
+	for (const c of cands) {
+		const b = row.createEl("button", {
+			cls: "free-doodle-btn free-doodle-hw-cand",
+			text: c.character,
+			attr: { title: `score ${c.score.toFixed(3)}` },
+		});
+		b.addEventListener("click", () => onPick(c.character));
+	}
+	const keep = row.createEl("button", { cls: "free-doodle-btn", text: "保留手写" });
+	keep.addEventListener("click", onKeep);
+	return pop;
+}
+
+/** 由手写笔迹生成美化文字笔迹（字号贴合原书写包围盒） */
+function hwTextStroke(batch: Stroke[], ch: string, font: string): Stroke | null {
+	const bb = strokesBBox(batch);
+	if (!bb) return null;
+	const pad = 4;
+	const wantFs = Math.max(16, Math.round(bb.h + pad * 2));
+	const size = Math.max(4, Math.round(wantFs / 4));
+	const fs = Math.max(12, size * 4);
+	const textW = fs * Array.from(ch).length;
+	const first = batch[0];
+	return {
+		color: first?.color ?? "#1e1e1e",
+		size,
+		erase: false,
+		alpha: 1,
+		text: ch,
+		font,
+		points: [{ x: bb.x - pad + (bb.w + pad * 2 - textW) / 2, y: bb.y - pad }],
+	};
+}
+
+/**
+ * 手写识别引擎：懒加载 HanziLookup 笔画数据（首用下载约 0.8MB 并缓存到插件目录）。
+ * 识别基于笔画轨迹而非位图 OCR，离线可用。
+ */
+class HandwritingEngine {
+	private ready = false;
+	private loading: Promise<void> | null = null;
+
+	constructor(private plugin: FreeDoodlePlugin) {}
+
+	private dataPath(): string {
+		const dir = this.plugin.manifest.dir;
+		if (!dir) throw new Error("plugin manifest.dir missing");
+		return `${dir}/${HW_DATA_FILE}`;
+	}
+
+	async ensureReady(): Promise<void> {
+		if (this.ready) return;
+		if (this.loading) return this.loading;
+		this.loading = this.load();
+		try {
+			await this.loading;
+		} finally {
+			this.loading = null;
+		}
+	}
+
+	private async load(): Promise<void> {
+		const path = this.dataPath();
+		const adapter = this.plugin.app.vault.adapter;
+		let text: string | null = null;
+		try {
+			if (await adapter.exists(path)) {
+				text = await adapter.read(path);
+				JSON.parse(text);
+			}
+		} catch {
+			text = null;
+		}
+		if (text === null) {
+			const notice = new Notice("手写识别：首次使用需下载汉字数据，请稍候…", 0);
+			try {
+				const res = await requestUrl({ url: MMAH_DATA_URL, method: "GET" });
+				text = res.text;
+				JSON.parse(text);
+			} finally {
+				notice.hide();
+			}
+			try {
+				await adapter.write(path, text);
+			} catch (e) {
+				Diag.log(`手写数据缓存失败: ${String(e)}`);
+			}
+		}
+		const json = JSON.parse(text) as { chars: unknown[]; substrokes: string };
+		const HL = getHanziLookup();
+		HL.data["mmah"] = {
+			chars: json.chars,
+			substrokes: HL.decodeCompact(json.substrokes),
+		};
+		this.ready = true;
+		Diag.log(`手写数据就绪 chars=${json.chars.length}`);
+	}
+
+	recognize(strokes: number[][][], limit = 6): Promise<HanziMatch[]> {
+		const HL = getHanziLookup();
+		const ac = new HL.AnalyzedCharacter(strokes);
+		const matcher = new HL.Matcher("mmah");
+		return new Promise((resolve) => {
+			matcher.match(ac, limit, (matches) => resolve(matches));
+		});
+	}
+}
+
 interface FreeDoodleSettings {
 	penColor: string;
 	penSize: number;
 	saveFolder: string;
 	autoFit: boolean;
 	stylusPressure: boolean;
+	/** 手写识别转文字后的美化字体 */
+	hwFont: string;
 	brushes: Record<BrushId, BrushCfg>;
 }
 
@@ -134,6 +306,7 @@ const DEFAULT_SETTINGS: FreeDoodleSettings = {
 	saveFolder: "涂鸦",
 	autoFit: true,
 	stylusPressure: true,
+	hwFont: "STKaiti, KaiTi, 楷体, 'Kaiti SC', 'Segoe Print', serif",
 	brushes: defaultBrushes(),
 };
 
@@ -359,14 +532,14 @@ function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, dx = 0, dy = 0): v
 			ctx.restore();
 			return;
 		}
-		const fs = Math.max(12, s.size * 4);
-		if (!s.erase) {
-			ctx.globalAlpha = s.alpha ?? 1;
-			ctx.fillStyle = s.color;
-			ctx.font = `${fs}px ${TEXT_FONT_FAMILY}`;
-			ctx.textBaseline = "top";
-			s.text.split("\n").forEach((ln, i) => ctx.fillText(ln, p.x, p.y + i * fs * 1.35));
-		}
+			const fs = Math.max(12, s.size * 4);
+			if (!s.erase) {
+				ctx.globalAlpha = s.alpha ?? 1;
+				ctx.fillStyle = s.color;
+				ctx.font = `${fs}px ${s.font ?? TEXT_FONT_FAMILY}`;
+				ctx.textBaseline = "top";
+				s.text.split("\n").forEach((ln, i) => ctx.fillText(ln, p.x, p.y + i * fs * 1.35));
+			}
 		ctx.restore();
 		return;
 	}
@@ -693,6 +866,7 @@ function parseStrokes(data: DoodleData | null): Stroke[] {
 				? s.pr.filter((n) => typeof n === "number" && n >= 0 && n <= 1)
 				: undefined,
 			text: typeof s.text === "string" ? s.text : undefined,
+			font: typeof s.font === "string" ? s.font : undefined,
 			density: typeof s.density === "number" ? Math.max(0, Math.min(100, s.density)) : undefined,
 		}))
 		.filter((s) => s.points.length > 0 || !!s.text);
@@ -733,6 +907,9 @@ class InkOverlay {
 	private shapeKind: DrawShape = "rect";
 	private eraseKind: EraseKind = "px";
 	private previewScheduled = false;
+	/** 手写识别模式下累计的笔迹（识别后替换为美化文字） */
+	private hwBatch: Stroke[] = [];
+	private hwBusy = false;
 
 	private swatchEls: HTMLElement[] = [];
 	private colorInputEl!: HTMLInputElement;
@@ -1034,6 +1211,13 @@ class InkOverlay {
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
+		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：手绘一个字，识别后转为美化字体", () =>
+			this.setMode("hw")
+		);
+		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹", () => void this.runHandwriting());
+
+		tb.createDiv({ cls: "free-doodle-sep" });
+
 		this.toolBtnEls["shape"] = mkBtn(
 			"shapes",
 			"形状：直线/箭头/矩形/椭圆/菱形",
@@ -1107,7 +1291,7 @@ class InkOverlay {
 	}
 
 	private onToolClick(
-		id: ToolMode | "erase" | "style" | "mic" | "undo" | "trash"
+		id: ToolMode | "erase" | "style" | "mic" | "undo" | "trash" | "hwrun"
 	): void {
 		switch (id) {
 			case "style":
@@ -1127,6 +1311,9 @@ class InkOverlay {
 				return;
 			case "trash":
 				this.clearAll();
+				return;
+			case "hwrun":
+				void this.runHandwriting();
 				return;
 			default:
 				this.setMode(id);
@@ -1425,8 +1612,12 @@ class InkOverlay {
 	}
 
 	private setMode(mode: ToolMode): void {
+		// 进出手写识别模式时重置待识别批次（笔迹本身保留）
+		if (mode !== this.tool.mode && (mode === "hw" || this.tool.mode === "hw")) {
+			this.hwBatch = [];
+		}
 		this.tool.mode = mode;
-		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明度
+		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明
 		// （笔迹 alpha 取自 curCfg().opacity，必须改笔刷配置而非 tool.opacity）
 		if (mode === "hl") {
 			const cfg = this.curCfg();
@@ -1475,12 +1666,14 @@ class InkOverlay {
 		if (hlBtn) hlBtn.toggleClass("is-active", this.tool.mode === "hl");
 		const micBtn = this.toolBtnEls["mic"];
 		if (micBtn) micBtn.toggleClass("is-active", this.recognizing);
-		for (const id of ["pencil", "ball", "marker", "laser"] as const) {
+		for (const id of ["pencil", "ball", "marker", "laser", "hw"] as const) {
 			const b = this.toolBtnEls[id];
 			if (b) b.toggleClass("is-active", this.tool.mode === id);
 		}
 		const textBtn = this.toolBtnEls["text"];
 		if (textBtn) textBtn.toggleClass("is-active", this.tool.mode === "text");
+		const hwRunBtn = this.toolBtnEls["hwrun"] as HTMLButtonElement | undefined;
+		if (hwRunBtn) hwRunBtn.disabled = this.hwBusy || this.hwBatch.length === 0;
 		if (this.colorInputEl) this.colorInputEl.value = this.tool.color;
 		if (this.sizeSliderEl) this.sizeSliderEl.value = String(this.tool.size);
 		if (this.sizeLabelEl) this.sizeLabelEl.setText(`${this.effSize()} px`);
@@ -1861,7 +2054,19 @@ class InkOverlay {
 		}
 
 		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
+		// 手写识别模式：原始笔迹入批次，不自动拟合
 		let final: Stroke = s;
+		if (this.tool.mode === "hw") {
+			this.hwBatch.push(final);
+			this.undoStack.push(this.strokes.slice());
+			this.redoStack.length = 0;
+			if (this.undoStack.length > 50) this.undoStack.shift();
+			this.strokes.push(final);
+			this.redraw();
+			this.scheduleSave();
+			this.syncTool();
+			return;
+		}
 		if (this.plugin.settings.autoFit) {
 			const fitted = fitFreehand(final);
 			if (fitted) final = fitted;
@@ -1876,6 +2081,85 @@ class InkOverlay {
 		this.scheduleSave();
 		this.syncTool();
 	};
+
+	/** 识别 hwBatch → 弹出候选 → 采用后替换为美化字体文字笔迹 */
+	private async runHandwriting(): Promise<void> {
+		if (this.hwBusy) return;
+		if (!this.hwBatch.length) {
+			new Notice("请先用「手写识别」模式写一个字，再点识别");
+			return;
+		}
+		this.hwBusy = true;
+		this.syncTool();
+		const notice = new Notice("手写识别：加载识别数据…", 0);
+		try {
+			await this.plugin.hwEngine.ensureReady();
+			notice.setMessage("手写识别：识别中…");
+			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			if (!cands.length) {
+				new Notice("未识别出候选字，请再写清晰一点");
+				return;
+			}
+			this.showHwCandidates(cands);
+		} catch (e) {
+			Diag.log(`手写识别失败: ${String(e)}`);
+			new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			notice.hide();
+			this.hwBusy = false;
+			this.syncTool();
+		}
+	}
+
+	private showHwCandidates(cands: HanziMatch[]): void {
+		const host = this.view.contentEl;
+		this.closePopover();
+		const bb = strokesBBox(this.hwBatch);
+		const p = bb
+			? { x: bb.x + (this.canvas?.getBoundingClientRect().left ?? 0), y: bb.y + bb.h + 10 }
+			: { x: 40, y: 80 };
+		const pop = buildHwCandidatePopover(
+			host,
+			cands,
+			(ch) => this.applyHwCandidate(ch),
+			() => {
+				this.hwBatch = [];
+				this.closePopover();
+				this.syncTool();
+			}
+		);
+		this.popover = pop;
+		pop.setCssStyles({
+			left: `${Math.round(Math.max(4, p.x))}px`,
+			top: `${Math.round(Math.max(4, p.y))}px`,
+		});
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover === pop && !pop.contains(t)) this.closePopover();
+		};
+		this.popCloser = closer;
+		window.addEventListener("pointerdown", closer, true);
+	}
+
+	private applyHwCandidate(ch: string): void {
+		this.closePopover();
+		const batch = this.hwBatch;
+		this.hwBatch = [];
+		if (!batch.length) return;
+		const st = hwTextStroke(batch, ch, this.plugin.settings.hwFont);
+		if (!st) return;
+		// 移除识别用的手写笔迹，插入美化文字
+		this.undoStack.push(this.strokes.slice());
+		this.redoStack.length = 0;
+		if (this.undoStack.length > 50) this.undoStack.shift();
+		this.strokes = this.strokes.filter((s) => !batch.includes(s));
+		this.attachAnchor(st);
+		this.strokes.push(st);
+		this.redraw();
+		this.scheduleSave();
+		this.syncTool();
+	}
 
 	// pointercancel（掌触/手势打断）提交半截笔迹而不是整笔丢弃
 	private onCancel = (evt?: PointerEvent): void => {
@@ -1905,6 +2189,7 @@ class InkOverlay {
 	}
 
 	private clearAll(): void {
+		this.hwBatch = [];
 		if (!this.strokes.length) return;
 		this.undoStack.push(this.strokes.slice());
 		this.redoStack.length = 0;
@@ -1915,6 +2200,7 @@ class InkOverlay {
 	}
 
 	clearAllForRemove(): void {
+		this.hwBatch = [];
 		this.strokes = [];
 		this.undoStack = [];
 		this.redoStack = [];
@@ -2270,9 +2556,10 @@ class InkOverlay {
 					s.pr && s.pr.length === s.points.length
 						? s.pr.map((n) => Math.round(n * 100) / 100)
 						: undefined,
-				text: s.text,
-				density: s.density,
-			})),
+			text: s.text,
+			font: s.font,
+			density: s.density,
+		})),
 		};
 	}
 
@@ -2342,6 +2629,7 @@ type ToolMode =
 	| "laser"
 	| "text"
 	| "shape"
+	| "hw"
 	| "erasePx"
 	| "eraseStroke";
 
@@ -2361,6 +2649,8 @@ function brushOf(mode: ToolMode): BrushId | null {
 			return "hl";
 		case "laser":
 			return "laser";
+		case "hw":
+			return "pen";
 		default:
 			return null;
 	}
@@ -2426,6 +2716,9 @@ class DoodleView extends ItemView {
 	private shapeKind: DrawShape = "rect";
 	private eraseKind: EraseKind = "px";
 	private previewScheduled = false;
+	/** 手写识别批次与忙碌状态 */
+	private hwBatch: Stroke[] = [];
+	private hwBusy = false;
 
 	private rect: DOMRect | null = null;
 	private cw = 0;
@@ -2547,6 +2840,7 @@ class DoodleView extends ItemView {
 			{ id: "laser" as const, icon: "flashlight", title: "激光笔（发光）" },
 			{ id: "shape" as const, icon: "shapes", title: "形状：直线/箭头/矩形/椭圆/菱形" },
 			{ id: "text" as const, icon: "type", title: "文本标注：点击画布插入文字" },
+			{ id: "hw" as const, icon: "languages", title: "手写识别：手绘一个字，识别后转为美化字体" },
 			{ id: "erase" as const, icon: "eraser", title: "橡皮：像素 / 整笔擦除" },
 		];
 		for (const t of tools) {
@@ -2555,6 +2849,10 @@ class DoodleView extends ItemView {
 			);
 		}
 
+		toolbar.createDiv({ cls: "free-doodle-sep" });
+		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹", () =>
+			void this.runHandwriting()
+		);
 		toolbar.createDiv({ cls: "free-doodle-sep" });
 
 		this.styleBtnEl = mkBtn("settings-2", "样式：颜色 / 粗细 / 不透明度 / 笔迹优化", () =>
@@ -2646,13 +2944,17 @@ class DoodleView extends ItemView {
 		}
 	}
 
-	private onBoardToolClick(id: BoardTool | "erase"): void {
+	private onBoardToolClick(id: BoardTool | "erase" | "hwrun"): void {
 		if (id === "shape") {
 			this.openBoardShapePopover(this.toolBtnEls["shape"] ?? this.styleBtnEl);
 			return;
 		}
 		if (id === "erase") {
 			this.openBoardErasePopover(this.toolBtnEls["erase"] ?? this.styleBtnEl);
+			return;
+		}
+		if (id === "hwrun") {
+			void this.runHandwriting();
 			return;
 		}
 		this.setBoardMode(id);
@@ -2680,12 +2982,14 @@ class DoodleView extends ItemView {
 		if (penBtn) penBtn.toggleClass("is-active", this.mode === "pen");
 		const hlBtn = this.toolBtnEls["hl"];
 		if (hlBtn) hlBtn.toggleClass("is-active", this.mode === "hl");
-		for (const id of ["pencil", "ball", "marker", "laser"] as const) {
+		for (const id of ["pencil", "ball", "marker", "laser", "hw"] as const) {
 			const b = this.toolBtnEls[id];
 			if (b) b.toggleClass("is-active", this.mode === id);
 		}
 		const textBtn = this.toolBtnEls["text"];
 		if (textBtn) textBtn.toggleClass("is-active", this.mode === "text");
+		const hwRunBtn = this.toolBtnEls["hwrun"] as HTMLButtonElement | undefined;
+		if (hwRunBtn) hwRunBtn.disabled = this.hwBusy || this.hwBatch.length === 0;
 		this.widthPresetEls.forEach((el) =>
 			el.toggleClass("is-active", Number(el.dataset.size) === this.curCfg().size)
 		);
@@ -2902,6 +3206,9 @@ class DoodleView extends ItemView {
 	}
 
 	private setBoardMode(mode: BoardTool): void {
+		if (mode !== this.mode && (mode === "hw" || this.mode === "hw")) {
+			this.hwBatch = [];
+		}
 		this.mode = mode;
 		// 荧光笔透明度同样写入笔刷配置（笔迹 alpha 来源）
 		if (mode === "hl") {
@@ -2973,6 +3280,7 @@ class DoodleView extends ItemView {
 	}
 
 	private clear(): void {
+		this.hwBatch = [];
 		if (!this.strokes.length) return;
 		this.pushUndo();
 		this.strokes = [];
@@ -3264,6 +3572,14 @@ class DoodleView extends ItemView {
 
 		// 笔迹平滑已在捕获期完成（EMA），此处仅做几何自动拟合
 		let final: Stroke = s;
+		if (this.mode === "hw") {
+			this.hwBatch.push(final);
+			this.pushUndo();
+			this.strokes.push(final);
+			this.redraw();
+			this.syncToolbar();
+			return;
+		}
 		if (this.plugin.settings.autoFit) {
 			const fitted = fitFreehand(final);
 			if (fitted) final = fitted;
@@ -3271,6 +3587,78 @@ class DoodleView extends ItemView {
 
 		this.pushUndo();
 		this.strokes.push(final);
+		this.redraw();
+		this.syncToolbar();
+	}
+
+	/** 识别 hwBatch → 候选弹层 → 采用后替换为美化文字 */
+	private async runHandwriting(): Promise<void> {
+		if (this.hwBusy) return;
+		if (!this.hwBatch.length) {
+			new Notice("请先用「手写识别」模式写一个字，再点识别");
+			return;
+		}
+		this.hwBusy = true;
+		this.syncToolbar();
+		const notice = new Notice("手写识别：加载识别数据…", 0);
+		try {
+			await this.plugin.hwEngine.ensureReady();
+			notice.setMessage("手写识别：识别中…");
+			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			if (!cands.length) {
+				new Notice("未识别出候选字，请再写清晰一点");
+				return;
+			}
+			this.showHwCandidates(cands);
+		} catch (e) {
+			Diag.log(`手写识别失败: ${String(e)}`);
+			new Notice(`手写识别失败：${e instanceof Error ? e.message : String(e)}`);
+		} finally {
+			notice.hide();
+			this.hwBusy = false;
+			this.syncToolbar();
+		}
+	}
+
+	private showHwCandidates(cands: HanziMatch[]): void {
+		this.closePopover();
+		const bb = strokesBBox(this.hwBatch);
+		const pop = buildHwCandidatePopover(
+			this.contentEl,
+			cands,
+			(ch) => this.applyHwCandidate(ch),
+			() => {
+				this.hwBatch = [];
+				this.closePopover();
+				this.syncToolbar();
+			}
+		);
+		this.popover = pop;
+		const left = bb ? bb.x : 40;
+		const top = bb ? bb.y + bb.h + 14 : 80;
+		pop.setCssStyles({
+			left: `${Math.round(Math.max(4, left))}px`,
+			top: `${Math.round(Math.max(4, top))}px`,
+		});
+		const closer = (e: MouseEvent) => {
+			const t = e.target as Node;
+			if (this.popover === pop && !pop.contains(t)) this.closePopover();
+		};
+		this.popCloser = closer;
+		window.addEventListener("pointerdown", closer, true);
+	}
+
+	private applyHwCandidate(ch: string): void {
+		this.closePopover();
+		const batch = this.hwBatch;
+		this.hwBatch = [];
+		if (!batch.length) return;
+		const st = hwTextStroke(batch, ch, this.plugin.settings.hwFont);
+		if (!st) return;
+		this.pushUndo();
+		this.strokes = this.strokes.filter((s) => !batch.includes(s));
+		this.strokes.push(st);
 		this.redraw();
 		this.syncToolbar();
 	}
@@ -3382,7 +3770,13 @@ export default class FreeDoodlePlugin extends Plugin {
 
 	overlays = new Map<MarkdownView, InkOverlay>();
 	activePath: string | null = null;
+	hwEngine: HandwritingEngine;
 	private sweepTimer: number | null = null;
+
+	constructor(app: App, manifest: PluginManifest) {
+		super(app, manifest);
+		this.hwEngine = new HandwritingEngine(this);
+	}
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
@@ -3809,6 +4203,16 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 						type: "toggle",
 						key: "stylusPressure",
 						defaultValue: true,
+					},
+				},
+				{
+					name: "Handwriting beautify font 手写识别美化字体",
+					desc: "CSS font stack for recognized characters. 识别手写字后替换为该字体的规范文字（如楷体）。",
+					control: {
+						type: "text",
+						key: "hwFont",
+						placeholder: DEFAULT_SETTINGS.hwFont,
+						defaultValue: DEFAULT_SETTINGS.hwFont,
 					},
 				},
 			];

@@ -162,6 +162,28 @@
 	outline: none;
 }
 
+/* 手写识别候选 */
+.free-doodle-hw-pop {
+	flex-direction: column;
+	min-width: 160px;
+}
+
+.free-doodle-hw-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-wrap: wrap;
+}
+
+.free-doodle-hw-cand {
+	min-width: 2em;
+	min-height: 2em;
+	font-size: 1.25em;
+	font-weight: 600;
+	line-height: 1;
+	padding: 4px 6px;
+}
+
 .free-doodle-inline {
 	margin: 8px 0;
 	line-height: 0;

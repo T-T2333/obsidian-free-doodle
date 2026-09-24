@@ -9,6 +9,7 @@ English | [中文](#中文说明)
 - **In-note doodling** — press `Ctrl+D` or click the highlighter ribbon icon to draw right on top of note content; works in editing and reading views
 - **Text anchoring** — every stroke remembers the paragraph/line it was drawn on; add/remove properties, paragraphs or resize panes and ink follows the anchored text
 - **Tools** — pen, translucent highlighter, rectangle box, pixel eraser, whole-stroke eraser
+- **Handwriting beautify** — write one Chinese character by hand, recognize it and replace it with a neat font glyph (HanziLookupJS; data downloaded once, then offline)
 - **Opacity slider** — 10%–100%, applies per stroke
 - **Reading mode & embeds** — ink overlays reading view automatically (and you can annotate there); doodles also render inside embeds and hover previews
 - **Clean storage** — strokes are saved as base64 in a `free-doodle` frontmatter property inside the note itself; the property removes itself automatically when empty
@@ -33,16 +34,21 @@ Add this repository: `T-T2333/obsidian-free-doodle`
 | Start / stop annotating | highlighter ribbon icon / `Ctrl+D` / command palette |
 | Finish & save | floating toolbar "done" button / `Esc` |
 | Undo | `Ctrl+Z` |
+| Recognize handwriting | enable the handwriting tool, write one character, click the sparkle icon |
 | Clear ink of current note | command "Clear doodle data of current note" |
 | Clean empty data vault-wide | command "Remove empty doodle properties across vault" |
 | Open standalone board | plugin settings button / command palette |
 
 ## Privacy & data access disclosure
 
-- The plugin makes **no network requests**
+- The plugin makes **no network requests** during normal drawing; the handwriting tool downloads recognition data (~0.8 MB, HanziLookupJS / Make Me a Hanzi) **once** on first use and caches it in the plugin folder
 - Ink data is stored locally inside your own notes
 - The *"Remove empty doodle properties across vault"* command enumerates markdown files in your vault solely to find empty `free-doodle` properties left by earlier versions
 - The standalone board writes exported PNGs to your clipboard when you click *Save PNG*
+
+## Credits
+
+- Handwriting recognition: [HanziLookupJS](https://github.com/gugray/HanziLookupJS) (GPL-3.0), stroke data from [Make Me a Hanzi](https://github.com/skishore/makemeahanzi) / Arphic PL
 
 ## Notes & limitations
 
@@ -75,6 +81,7 @@ npx eslint main.ts
 - **笔记内涂鸦**：`Ctrl+D` 或点击左侧荧光笔图标，直接在正文上方标注；编辑 / 阅读模式均支持
 - **文字锚点跟随**：每一笔自动锚定所在段落或行——增删属性、段落或拖动侧边栏导致文字移动时，墨迹跟着走
 - **多种工具**：钢笔、荧光笔（半透明）、矩形框选、像素橡皮擦、整笔擦除
+- **手写美化**：手绘一个汉字，识别后替换为规范美化字体（HanziLookupJS；首次使用下载数据，之后离线）
 - **不透明度滑杆**：10%–100%，逐笔生效
 - **阅读模式与嵌入**：阅读视图自动叠加显示墨迹（也可直接涂鸦）；嵌入引用与悬浮预览同样渲染
 - **干净存储**：墨迹以 base64 存入笔记自身 frontmatter 的 `free-doodle` 属性，清空后自动删除，不留痕迹
@@ -101,16 +108,21 @@ npx eslint main.ts
 | 进入/退出涂鸦模式 | 左侧荧光笔图标 / `Ctrl+D` / 命令面板 |
 | 完成并保存 | 浮动工具栏"完成"按钮 / `Esc` |
 | 撤销 | `Ctrl+Z` |
+| 手写识别 | 选择「手写识别」工具 → 写一个字 → 点击 ✨ 识别按钮 |
 | 清空当前笔记墨迹 | 命令面板"清除当前笔记的涂鸦数据" |
 | 批量清理空数据 | 命令面板"清理全库" |
 | 打开独立画板 | 设置页按钮 / 命令面板 |
 
 ## 隐私与数据访问说明
 
-- 插件**不发任何网络请求**
+- 正常涂鸦**不发任何网络请求**；「手写识别」首次使用会下载一次汉字识别数据（约 0.8MB，HanziLookupJS / Make Me a Hanzi）并缓存到插件目录，之后离线可用
 - 墨迹数据仅保存在你自己的笔记内
 - "清理全库"命令会枚举库内 Markdown 文件，目的仅为查找历史版本遗留的空涂鸦属性
 - 独立画板点击"保存 PNG"时会写入系统剪贴板
+
+## 致谢
+
+- 手写识别：[HanziLookupJS](https://github.com/gugray/HanziLookupJS)（GPL-3.0），笔画数据来自 [Make Me a Hanzi](https://github.com/skishore/makemeahanzi) / Arphic PL
 
 ## 注意事项
 
