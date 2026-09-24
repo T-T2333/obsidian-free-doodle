@@ -118,11 +118,17 @@ interface HanziLookupApi {
 }
 
 /** 库由 hanzilookup.min.js 挂到 window（脚本内 var 与 declare global 会冲突，故显式取用） */
-function getHanziLookup(): HanziLookupApi {
-	return (window as unknown as { HanziLookup: HanziLookupApi }).HanziLookup;
+function getHanziLookup(): HanziLookupApi | null {
+	const hl = (window as unknown as { HanziLookup?: HanziLookupApi }).HanziLookup;
+	return hl ?? null;
 }
 
-const MMAH_DATA_URL = "https://cdn.jsdelivr.net/gh/gugray/HanziLookupJS@master/dist/mmah.json";
+/** 首用下载镜像（按序尝试；首个成功后写入插件目录缓存） */
+const MMAH_DATA_URLS = [
+	"https://fastly.jsdelivr.net/gh/gugray/HanziLookupJS@master/dist/mmah.json",
+	"https://cdn.jsdelivr.net/gh/gugray/HanziLookupJS@master/dist/mmah.json",
+	"https://raw.githubusercontent.com/gugray/HanziLookupJS/master/dist/mmah.json",
+];
 const HW_DATA_FILE = "hanzi-mmah.json";
 
 /** 笔迹集合的包围盒（含线宽），无有效点返回 null */
@@ -232,21 +238,44 @@ class HandwritingEngine {
 		}
 		if (text === null) {
 			const notice = new Notice("手写识别：首次使用需下载汉字数据，请稍候…", 0);
+			let lastErr: unknown = null;
 			try {
-				const res = await requestUrl({ url: MMAH_DATA_URL, method: "GET" });
-				text = res.text;
-				JSON.parse(text);
-			} finally {
-				notice.hide();
+					for (const url of MMAH_DATA_URLS) {
+						try {
+							const res = await requestUrl({ url, method: "GET", headers: {} });
+							const body = res.text;
+							const parsed = JSON.parse(body) as { chars?: unknown; substrokes?: unknown };
+							if (!Array.isArray(parsed.chars) || typeof parsed.substrokes !== "string") {
+								throw new Error("识别数据格式无效");
+							}
+							text = body;
+							lastErr = null;
+							break;
+						} catch (e) {
+							lastErr = e;
+							Diag.log(`手写数据下载失败 ${url}: ${String(e)}`);
+						}
+					}
+					if (text === null) {
+						throw lastErr instanceof Error
+							? lastErr
+							: new Error("识别数据下载失败（请检查网络/代理后重试）");
+					}
+				} finally {
+					notice.hide();
+				}
+				try {
+					await adapter.write(path, text);
+				} catch (e) {
+					Diag.log(`手写数据缓存失败: ${String(e)}`);
+				}
 			}
-			try {
-				await adapter.write(path, text);
-			} catch (e) {
-				Diag.log(`手写数据缓存失败: ${String(e)}`);
+			const json = JSON.parse(text) as { chars: unknown[]; substrokes: string };
+			if (!Array.isArray(json.chars) || typeof json.substrokes !== "string") {
+				throw new Error("识别数据格式无效，请删除插件目录内 hanzi-mmah.json 后重试");
 			}
-		}
-		const json = JSON.parse(text) as { chars: unknown[]; substrokes: string };
-		const HL = getHanziLookup();
+			const HL = getHanziLookup();
+		if (!HL) throw new Error("识别引擎未加载（请重新启用插件）");
 		HL.data["mmah"] = {
 			chars: json.chars,
 			substrokes: HL.decodeCompact(json.substrokes),
@@ -257,10 +286,65 @@ class HandwritingEngine {
 
 	recognize(strokes: number[][][], limit = 6): Promise<HanziMatch[]> {
 		const HL = getHanziLookup();
-		const ac = new HL.AnalyzedCharacter(strokes);
-		const matcher = new HL.Matcher("mmah");
-		return new Promise((resolve) => {
-			matcher.match(ac, limit, (matches) => resolve(matches));
+		if (!HL) return Promise.reject(new Error("识别引擎未加载"));
+		// 识别器要求每笔 ≥2 个有效点；空/单点笔画会抛错或永不回调
+		const cleaned = strokes
+			.map((s) => s.filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1])))
+			.filter((s) => s.length >= 2);
+		if (!cleaned.length) return Promise.resolve([]);
+
+		let ac: unknown;
+		try {
+			ac = new HL.AnalyzedCharacter(cleaned);
+		} catch (e) {
+			return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+		}
+		const analyzed = ac as { analyzedStrokes?: unknown[] };
+		if (!analyzed.analyzedStrokes || analyzed.analyzedStrokes.length === 0) {
+			return Promise.resolve([]);
+		}
+
+		let matcher: { match(ac: unknown, limit: number, cb: (m: HanziMatch[]) => void): void };
+		try {
+			matcher = new HL.Matcher("mmah");
+		} catch (e) {
+			return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+		}
+
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const timer = window.setTimeout(() => {
+				if (!settled) {
+					settled = true;
+					reject(new Error("识别超时"));
+				}
+			}, 8000);
+			const finish = (fn: () => void) => {
+				if (settled) return;
+				settled = true;
+				window.clearTimeout(timer);
+				fn();
+			};
+			try {
+				// 多取一些再过滤无效分，避免 NaN/-Infinity 占位
+				matcher.match(ac, Math.max(limit, 16), (matches) => {
+					finish(() => {
+						const good = (matches || [])
+							.filter(
+								(m) =>
+									!!m &&
+									typeof m.character === "string" &&
+									m.character.length > 0 &&
+									Number.isFinite(m.score)
+							)
+							.sort((a, b) => b.score - a.score)
+							.slice(0, limit);
+						resolve(good);
+					});
+				});
+			} catch (e) {
+				finish(() => reject(e instanceof Error ? e : new Error(String(e))));
+			}
 		});
 	}
 }
@@ -1612,9 +1696,9 @@ class InkOverlay {
 	}
 
 	private setMode(mode: ToolMode): void {
-		// 进出手写识别模式时重置待识别批次（笔迹本身保留）
-		if (mode !== this.tool.mode && (mode === "hw" || this.tool.mode === "hw")) {
-			this.hwBatch = [];
+		// 切走手写模式时保留批次（识别前再过滤已撤销笔画），便于回头点识别
+		if (mode === "hw" && this.tool.mode !== "hw") {
+			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		}
 		this.tool.mode = mode;
 		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明
@@ -2085,20 +2169,23 @@ class InkOverlay {
 	/** 识别 hwBatch → 弹出候选 → 采用后替换为美化字体文字笔迹 */
 	private async runHandwriting(): Promise<void> {
 		if (this.hwBusy) return;
+		// 识别前剔除已被撤销/擦除的笔画
+		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先用「手写识别」模式写一个字，再点识别");
+			new Notice("请先切到「手写识别」工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
 		this.syncTool();
-		const notice = new Notice("手写识别：加载识别数据…", 0);
+		const notice = new Notice("手写识别：加载数据…", 0);
 		try {
 			await this.plugin.hwEngine.ensureReady();
 			notice.setMessage("手写识别：识别中…");
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
 			if (!cands.length) {
-				new Notice("未识别出候选字，请再写清晰一点");
+				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
 			this.showHwCandidates(cands);
@@ -2115,10 +2202,6 @@ class InkOverlay {
 	private showHwCandidates(cands: HanziMatch[]): void {
 		const host = this.view.contentEl;
 		this.closePopover();
-		const bb = strokesBBox(this.hwBatch);
-		const p = bb
-			? { x: bb.x + (this.canvas?.getBoundingClientRect().left ?? 0), y: bb.y + bb.h + 10 }
-			: { x: 40, y: 80 };
 		const pop = buildHwCandidatePopover(
 			host,
 			cands,
@@ -2130,16 +2213,36 @@ class InkOverlay {
 			}
 		);
 		this.popover = pop;
+		// contentEl 为定位上下文；用 contentEl 与 canvas 的相对偏移换算，避免跑出视口
+		const bb = strokesBBox(this.hwBatch);
+		const cRect = host.getBoundingClientRect();
+		const canvasRect = this.canvas?.getBoundingClientRect();
+		let left = 16;
+		let top = 16;
+		if (bb && canvasRect) {
+			left = canvasRect.left - cRect.left + bb.x;
+			top = canvasRect.top - cRect.top + bb.y + bb.h + 10;
+		}
 		pop.setCssStyles({
-			left: `${Math.round(Math.max(4, p.x))}px`,
-			top: `${Math.round(Math.max(4, p.y))}px`,
+			left: "0px",
+			top: "0px",
+			visibility: "hidden",
+		});
+		const pw = pop.offsetWidth || 200;
+		const ph = pop.offsetHeight || 60;
+		left = Math.max(6, Math.min(left, cRect.width - pw - 6));
+		top = Math.max(6, Math.min(top, cRect.height - ph - 6));
+		pop.setCssStyles({
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+			visibility: "visible",
 		});
 		const closer = (e: MouseEvent) => {
 			const t = e.target as Node;
 			if (this.popover === pop && !pop.contains(t)) this.closePopover();
 		};
 		this.popCloser = closer;
-		window.addEventListener("pointerdown", closer, true);
+		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
 	}
 
 	private applyHwCandidate(ch: string): void {
@@ -3206,8 +3309,8 @@ class DoodleView extends ItemView {
 	}
 
 	private setBoardMode(mode: BoardTool): void {
-		if (mode !== this.mode && (mode === "hw" || this.mode === "hw")) {
-			this.hwBatch = [];
+		if (mode === "hw" && this.mode !== "hw") {
+			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		}
 		this.mode = mode;
 		// 荧光笔透明度同样写入笔刷配置（笔迹 alpha 来源）
@@ -3594,20 +3697,22 @@ class DoodleView extends ItemView {
 	/** 识别 hwBatch → 候选弹层 → 采用后替换为美化文字 */
 	private async runHandwriting(): Promise<void> {
 		if (this.hwBusy) return;
+		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先用「手写识别」模式写一个字，再点识别");
+			new Notice("请先切到「手写识别」工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
 		this.syncToolbar();
-		const notice = new Notice("手写识别：加载识别数据…", 0);
+		const notice = new Notice("手写识别：加载数据…", 0);
 		try {
 			await this.plugin.hwEngine.ensureReady();
 			notice.setMessage("手写识别：识别中…");
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
+			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
 			if (!cands.length) {
-				new Notice("未识别出候选字，请再写清晰一点");
+				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
 			}
 			this.showHwCandidates(cands);
@@ -3623,7 +3728,6 @@ class DoodleView extends ItemView {
 
 	private showHwCandidates(cands: HanziMatch[]): void {
 		this.closePopover();
-		const bb = strokesBBox(this.hwBatch);
 		const pop = buildHwCandidatePopover(
 			this.contentEl,
 			cands,
@@ -3635,18 +3739,31 @@ class DoodleView extends ItemView {
 			}
 		);
 		this.popover = pop;
-		const left = bb ? bb.x : 40;
-		const top = bb ? bb.y + bb.h + 14 : 80;
+		const bb = strokesBBox(this.hwBatch);
+		const cRect = this.contentEl.getBoundingClientRect();
+		const canvasRect = this.canvas.getBoundingClientRect();
+		let left = 16;
+		let top = 80;
+		if (bb) {
+			left = canvasRect.left - cRect.left + bb.x;
+			top = canvasRect.top - cRect.top + bb.y + bb.h + 14;
+		}
+		pop.setCssStyles({ left: "0px", top: "0px", visibility: "hidden" });
+		const pw = pop.offsetWidth || 200;
+		const ph = pop.offsetHeight || 60;
+		left = Math.max(6, Math.min(left, cRect.width - pw - 6));
+		top = Math.max(6, Math.min(top, cRect.height - ph - 6));
 		pop.setCssStyles({
-			left: `${Math.round(Math.max(4, left))}px`,
-			top: `${Math.round(Math.max(4, top))}px`,
+			left: `${Math.round(left)}px`,
+			top: `${Math.round(top)}px`,
+			visibility: "visible",
 		});
 		const closer = (e: MouseEvent) => {
 			const t = e.target as Node;
 			if (this.popover === pop && !pop.contains(t)) this.closePopover();
 		};
 		this.popCloser = closer;
-		window.addEventListener("pointerdown", closer, true);
+		window.setTimeout(() => window.addEventListener("pointerdown", closer, true), 0);
 	}
 
 	private applyHwCandidate(ch: string): void {
