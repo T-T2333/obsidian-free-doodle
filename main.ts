@@ -1075,6 +1075,27 @@ class InkOverlay {
 		this.mount();
 	}
 
+	getDiagMode(): string {
+		return this.tool.mode;
+	}
+
+	getDiagHwBatch(): number {
+		return this.hwBatch.length;
+	}
+
+	isDiagInteractive(): boolean {
+		return this.interactive;
+	}
+
+	/** 命令面板入口：进入手写识别模式 */
+	enterHwMode(): void {
+		if (!this.interactive || this.destroyed) {
+			new Notice("请先进入涂鸦模式再使用手写识别");
+			return;
+		}
+		this.setMode("hw");
+	}
+
 	destroy(save: boolean): void {
 		if (this.destroyed) return;
 		this.destroyed = true;
@@ -1295,10 +1316,12 @@ class InkOverlay {
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
-		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：手绘一个字，识别后转为美化字体", () =>
+		this.toolBtnEls["hw"] = mkBtn("languages", "手写识别：先点这里，手绘一个字，再点 ✨", () =>
 			this.setMode("hw")
 		);
-		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹", () => void this.runHandwriting());
+		this.toolBtnEls["hwrun"] = mkBtn("sparkles", "识别当前手写笔迹（需先用手写工具写几笔）", () =>
+			void this.runHandwriting()
+		);
 
 		tb.createDiv({ cls: "free-doodle-sep" });
 
@@ -1699,6 +1722,10 @@ class InkOverlay {
 		// 切走手写模式时保留批次（识别前再过滤已撤销笔画），便于回头点识别
 		if (mode === "hw" && this.tool.mode !== "hw") {
 			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
+			Diag.log(`setMode→hw batch=${this.hwBatch.length}`);
+			new Notice("手写模式：在此模式下写一个字（可多笔），写完点 ✨ 识别");
+		} else {
+			Diag.log(`setMode ${this.tool.mode}→${mode}`);
 		}
 		this.tool.mode = mode;
 		// 切到荧光笔时若笔刷不透明度过高，自动降为典型荧光笔透明
@@ -2142,6 +2169,7 @@ class InkOverlay {
 		let final: Stroke = s;
 		if (this.tool.mode === "hw") {
 			this.hwBatch.push(final);
+			Diag.log(`hw入批 batch=${this.hwBatch.length} pts=${final.points.length}`);
 			this.undoStack.push(this.strokes.slice());
 			this.redoStack.length = 0;
 			if (this.undoStack.length > 50) this.undoStack.shift();
@@ -2168,11 +2196,12 @@ class InkOverlay {
 
 	/** 识别 hwBatch → 弹出候选 → 采用后替换为美化字体文字笔迹 */
 	private async runHandwriting(): Promise<void> {
+		Diag.log(`runHandwriting mode=${this.tool.mode} batch=${this.hwBatch.length} busy=${this.hwBusy}`);
 		if (this.hwBusy) return;
 		// 识别前剔除已被撤销/擦除的笔画
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先切到「手写识别」工具，写一个字，再点识别按钮");
+			new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
@@ -2184,6 +2213,7 @@ class InkOverlay {
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
 			if (!cands.length) {
 				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
@@ -3311,6 +3341,10 @@ class DoodleView extends ItemView {
 	private setBoardMode(mode: BoardTool): void {
 		if (mode === "hw" && this.mode !== "hw") {
 			this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
+			Diag.log(`setBoardMode→hw batch=${this.hwBatch.length}`);
+			new Notice("手写模式：在此模式下写一个字（可多笔），写完点 ✨ 识别");
+		} else {
+			Diag.log(`setBoardMode ${this.mode}→${mode}`);
 		}
 		this.mode = mode;
 		// 荧光笔透明度同样写入笔刷配置（笔迹 alpha 来源）
@@ -3677,6 +3711,7 @@ class DoodleView extends ItemView {
 		let final: Stroke = s;
 		if (this.mode === "hw") {
 			this.hwBatch.push(final);
+			Diag.log(`hw入批 batch=${this.hwBatch.length} pts=${final.points.length}`);
 			this.pushUndo();
 			this.strokes.push(final);
 			this.redraw();
@@ -3696,10 +3731,11 @@ class DoodleView extends ItemView {
 
 	/** 识别 hwBatch → 候选弹层 → 采用后替换为美化文字 */
 	private async runHandwriting(): Promise<void> {
+		Diag.log(`runHandwriting mode=${this.mode} batch=${this.hwBatch.length} busy=${this.hwBusy}`);
 		if (this.hwBusy) return;
 		this.hwBatch = this.hwBatch.filter((s) => this.strokes.includes(s));
 		if (!this.hwBatch.length) {
-			new Notice("请先切到「手写识别」工具，写一个字，再点识别按钮");
+			new Notice("请先切到手写识别工具，写一个字，再点识别按钮");
 			return;
 		}
 		this.hwBusy = true;
@@ -3711,6 +3747,7 @@ class DoodleView extends ItemView {
 			const pts = this.hwBatch.map((s) => s.points.map((p) => [p.x, p.y]));
 			Diag.log(`手写识别 strokes=${pts.length} pts=${pts.map((s) => s.length).join(",")}`);
 			const cands = await this.plugin.hwEngine.recognize(pts, 6);
+			Diag.log(`手写识别结果 n=${cands.length} ${cands.map((c) => c.character).join("")}`);
 			if (!cands.length) {
 				new Notice("未识别出候选：请一次只写一个字、笔画完整些");
 				return;
@@ -3909,6 +3946,20 @@ export default class FreeDoodlePlugin extends Plugin {
 			name: "开始 / 结束当前笔记涂鸦",
 			callback: () => {
 				void this.toggleAnnotate();
+			},
+		});
+
+		this.addCommand({
+			id: "handwriting-mode",
+			name: "手写识别模式（写一个字后识别为美化字体）",
+			callback: () => {
+				const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+				const ov = view ? this.overlays.get(view) : undefined;
+				if (!ov) {
+					new Notice("请先用 Ctrl+D 或荧光笔图标进入涂鸦模式");
+					return;
+				}
+				ov.enterHwMode();
 			},
 		});
 
@@ -4343,7 +4394,11 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 			name: "Diagnostics 诊断日志",
 			desc: "Overlay mount/save events and live canvas state. 覆盖层事件与画布实时状态。",
 			render: (setting) => {
-				this.mountDiagnostics(setting.controlEl);
+				// 整行全宽渲染（controlEl 是右侧窄栏，放不下 textarea）
+				setting.settingEl.toggleClass("free-doodle-diag-row", true);
+				const host = setting.settingEl.createDiv({ cls: "free-doodle-diag-host" });
+				this.mountDiagnostics(host);
+				return () => host.remove();
 			},
 		};
 		return [generalGroup, diagnostics];
@@ -4351,19 +4406,28 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 
 	private buildDiagnostics(containerEl: HTMLElement): void {
 		new Setting(containerEl).setName("诊断日志").setHeading();
-		this.mountDiagnostics(containerEl);
+		const host = containerEl.createDiv({ cls: "free-doodle-diag-host" });
+		this.mountDiagnostics(host);
 	}
 
 	private mountDiagnostics(parent: HTMLElement): void {
 		const textarea = parent.createEl("textarea", {
 			cls: "free-doodle-diag",
-			attr: { readonly: "true", spellcheck: "false" },
+			attr: { readonly: "true", spellcheck: "false", "aria-label": "诊断日志" },
 		});
 		textarea.rows = 16;
 		const refresh = () => {
 			const lines: string[] = [Diag.dump()];
 			lines.push(`---- 实时状态 ----`);
 			lines.push(`activePath=${this.plugin.activePath ?? "null"} overlays=${this.plugin.overlays.size}`);
+			const ov = this.plugin.activePath
+				? [...this.plugin.overlays.values()].find((o) => o.file.path === this.plugin.activePath)
+				: undefined;
+			if (ov) {
+				lines.push(
+					`mode=${ov.getDiagMode()} hwBatch=${ov.getDiagHwBatch()} interactive=${ov.isDiagInteractive()}`
+				);
+			}
 			document.querySelectorAll(".free-doodle-canvas").forEach((c, i) => {
 				const cv = c as HTMLCanvasElement;
 				const r = cv.getBoundingClientRect();
@@ -4373,36 +4437,30 @@ class FreeDoodleSettingTab extends PluginSettingTab {
 						`parent=${(cv.parentElement?.className ?? "null").slice(0, 50)}`
 				);
 			});
-			if (!lines[1]) lines.splice(1, 1);
 			textarea.value = lines.filter((l) => l.length > 0).join("\n");
 		};
 
-		new Setting(parent)
-			.setName("诊断日志")
-			.setDesc("记录覆盖层挂载/保存/销毁等关键事件与画布实时状态")
-			.addButton((b) =>
-				b.setButtonText("刷新").onClick(() => {
-					refresh();
-				})
-			)
-			.addButton((b) =>
-				b.setButtonText("复制全部").onClick(async () => {
-					refresh();
-					try {
-						await navigator.clipboard.writeText(textarea.value);
-						new Notice("诊断信息已复制到剪贴板");
-					} catch {
-						new Notice("复制失败，请手动全选复制");
-					}
-				})
-			)
-			.addButton((b) =>
-				b.setButtonText("清空").onClick(() => {
-					Diag.clear();
-					refresh();
-				})
+		const btnRow = parent.createDiv({ cls: "free-doodle-diag-actions" });
+		const mk = (label: string, onClick: () => void) => {
+			const b = btnRow.createEl("button", { cls: "mod-cta free-doodle-btn", text: label });
+			b.addEventListener("click", onClick);
+		};
+		mk("刷新", () => refresh());
+		mk("复制全部", () => {
+			refresh();
+			void navigator.clipboard.writeText(textarea.value).then(
+				() => new Notice("诊断信息已复制到剪贴板"),
+				() => new Notice("复制失败，请手动全选复制")
 			);
+		});
+		mk("清空", () => {
+			Diag.clear();
+			refresh();
+		});
 
+		// 打开设置页时自动刷一次；之后仅手动刷新（避免遮挡用户滚动）
 		refresh();
 	}
 }
+
+/* ------------------------------------------------------------------ */

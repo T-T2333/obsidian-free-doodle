@@ -208,11 +208,51 @@
 
 .free-doodle-diag {
 	width: 100%;
+	min-height: 12em;
 	font-family: var(--font-monospace);
 	font-size: var(--font-ui-smaller);
-	line-height: 1.4;
+	line-height: 1.45;
 	resize: vertical;
 	white-space: pre;
+	overflow-wrap: normal;
+	overflow-x: auto;
+	box-sizing: border-box;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: var(--radius-s);
+	background: var(--background-primary);
+	color: var(--text-normal);
+}
+
+.free-doodle-diag-row {
+	display: block !important;
+	flex-direction: unset;
+	align-items: unset;
+	padding-top: 12px;
+	padding-bottom: 12px;
+}
+
+.free-doodle-diag-row > .setting-item-info {
+	margin-bottom: 6px;
+}
+
+.free-doodle-diag-host {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	width: 100%;
+}
+
+.free-doodle-diag-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	align-items: center;
+}
+
+.free-doodle-diag-actions .free-doodle-btn {
+	height: auto;
+	min-height: 28px;
 }
 
 /* ============ 独立画板 ============ */
