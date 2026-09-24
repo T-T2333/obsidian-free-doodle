@@ -184,6 +184,28 @@
 	padding: 4px 6px;
 }
 
+.free-doodle-hw-line-input {
+	width: min(320px, 60vw);
+	min-height: 32px;
+	font-size: var(--font-ui-medium);
+}
+
+.free-doodle-font-import {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.free-doodle-font-input {
+	max-width: 280px;
+}
+
+.free-doodle-font-status {
+	color: var(--text-muted);
+	font-size: var(--font-ui-smaller);
+}
+
 .free-doodle-inline {
 	margin: 8px 0;
 	line-height: 0;

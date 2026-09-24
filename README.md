@@ -9,7 +9,8 @@ English | [中文](#中文说明)
 - **In-note doodling** — press `Ctrl+D` or click the highlighter ribbon icon to draw right on top of note content; works in editing and reading views
 - **Text anchoring** — every stroke remembers the paragraph/line it was drawn on; add/remove properties, paragraphs or resize panes and ink follows the anchored text
 - **Tools** — pen, translucent highlighter, rectangle box, pixel eraser, whole-stroke eraser
-- **Handwriting beautify** — write one Chinese character by hand, recognize it and replace it with a neat font glyph (PP-OCRv5; model downloaded once ~28 MB, then offline; HanziLookupJS as fallback)
+- **Handwriting beautify** — write a line of Chinese characters, English letters, or digits, recognize it, and replace it with editable neat text (PP-OCRv5; model downloaded once ~28 MB, then offline; HanziLookupJS as fallback)
+- **Custom beautify font** — import a local `.ttf`, `.otf`, `.woff`, or `.woff2` font in settings; it is cached locally and used for newly recognized handwriting
 - **Opacity slider** — 10%–100%, applies per stroke
 - **Reading mode & embeds** — ink overlays reading view automatically (and you can annotate there); doodles also render inside embeds and hover previews
 - **Clean storage** — strokes are saved as base64 in a `free-doodle` frontmatter property inside the note itself; the property removes itself automatically when empty
@@ -34,7 +35,7 @@ Add this repository: `T-T2333/obsidian-free-doodle`
 | Start / stop annotating | highlighter ribbon icon / `Ctrl+D` / command palette |
 | Finish & save | floating toolbar "done" button / `Esc` |
 | Undo | `Ctrl+Z` |
-| Recognize handwriting | enable the handwriting tool, write one character, click the sparkle icon |
+| Recognize handwriting | enable the handwriting tool, write a line (leave small gaps between characters), then pause for auto-replace or use the sparkle icon to edit the result |
 | Clear ink of current note | command "Clear doodle data of current note" |
 | Clean empty data vault-wide | command "Remove empty doodle properties across vault" |
 | Open standalone board | plugin settings button / command palette |
@@ -42,6 +43,7 @@ Add this repository: `T-T2333/obsidian-free-doodle`
 ## Privacy & data access disclosure
 
 - The plugin makes **no network requests** during normal drawing; the handwriting tool downloads recognition assets **once** on first use and caches them in the plugin folder — PP-OCRv5 model + ONNX Runtime Web runtime (~28 MB total; multi-mirror, offline afterwards). If that fails, it may fall back to HanziLookupJS data (~0.8 MB, Make Me a Hanzi)
+- Imported beautify fonts stay local: the selected file is copied to the plugin folder and never uploaded
 - Ink data is stored locally inside your own notes
 - The *"Remove empty doodle properties across vault"* command enumerates markdown files in your vault solely to find empty `free-doodle` properties left by earlier versions
 - The standalone board writes exported PNGs to your clipboard when you click *Save PNG*
@@ -82,7 +84,8 @@ npx eslint main.ts
 - **笔记内涂鸦**：`Ctrl+D` 或点击左侧荧光笔图标，直接在正文上方标注；编辑 / 阅读模式均支持
 - **文字锚点跟随**：每一笔自动锚定所在段落或行——增删属性、段落或拖动侧边栏导致文字移动时，墨迹跟着走
 - **多种工具**：钢笔、荧光笔（半透明）、矩形框选、像素橡皮擦、整笔擦除
-- **手写美化**：手绘一个汉字，停顿后自动识别并替换为规范美化字体（PP-OCRv5；首次使用下载约 28MB 模型后离线；失败时回退 HanziLookupJS）
+- **手写美化**：手绘一行中文、英文或数字，停顿后自动识别并替换为可编辑的美化文字（PP-OCRv5；首次使用下载约 28MB 模型后离线；失败时回退 HanziLookupJS）
+- **自定义美化字体**：在设置中导入本地 `.ttf`、`.otf`、`.woff` 或 `.woff2` 字体，之后新识别的手写文字会使用该字体
 - **不透明度滑杆**：10%–100%，逐笔生效
 - **阅读模式与嵌入**：阅读视图自动叠加显示墨迹（也可直接涂鸦）；嵌入引用与悬浮预览同样渲染
 - **干净存储**：墨迹以 base64 存入笔记自身 frontmatter 的 `free-doodle` 属性，清空后自动删除，不留痕迹
@@ -109,7 +112,7 @@ npx eslint main.ts
 | 进入/退出涂鸦模式 | 左侧荧光笔图标 / `Ctrl+D` / 命令面板 |
 | 完成并保存 | 浮动工具栏"完成"按钮 / `Esc` |
 | 撤销 | `Ctrl+Z` |
-| 手写识别 | 选择「手写识别」工具 → 写一个字 → 停顿约 1 秒自动替换为美化字（✨ 可手动挑选候选） |
+| 手写识别 | 选择「手写识别」工具 → 写一行中文/英文/数字（字符间留一点空隙）→ 停顿约 1.2 秒自动替换整行（✨ 可手动编辑识别结果） |
 | 清空当前笔记墨迹 | 命令面板"清除当前笔记的涂鸦数据" |
 | 批量清理空数据 | 命令面板"清理全库" |
 | 打开独立画板 | 设置页按钮 / 命令面板 |
@@ -117,6 +120,7 @@ npx eslint main.ts
 ## 隐私与数据访问说明
 
 - 正常涂鸦**不发任何网络请求**；「手写识别」首次使用会下载一次识别资源并缓存到插件目录（PP-OCRv5 模型 + ONNX Runtime Web，合计约 28MB，多镜像、之后离线）；若失败则回退下载 HanziLookupJS 数据（约 0.8MB，Make Me a Hanzi）
+- 导入的美化字体只保存在本地插件目录，不会上传；新识别的文字会使用该字体
 - 墨迹数据仅保存在你自己的笔记内
 - "清理全库"命令会枚举库内 Markdown 文件，目的仅为查找历史版本遗留的空涂鸦属性
 - 独立画板点击"保存 PNG"时会写入系统剪贴板
